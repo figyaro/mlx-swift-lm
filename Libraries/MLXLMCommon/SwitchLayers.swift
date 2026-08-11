@@ -223,6 +223,8 @@ public class FusedGateUpSwitchGLU: Module {
         }
 
         if let decodeQuantization,
+            !(gateUpProj is QuantizedSwitchLinear),
+            !(downProj is QuantizedSwitchLinear),
             !doSort, gateUpProj.bias == nil, downProj.bias == nil,
             indices.dim(0) == 1, indices.dim(1) == 1 {
             decodeQuantizedWeightsLock.lock()
