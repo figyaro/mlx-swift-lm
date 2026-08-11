@@ -2,6 +2,7 @@ import Foundation
 import Testing
 
 @testable import MLXLLM
+import MLXLMCommon
 
 @Suite("BailingMoeV3 configuration")
 struct BailingMoeV3Tests {
@@ -91,5 +92,63 @@ struct BailingMoeV3Tests {
                 )
             )
         }
+    }
+
+    @Test("creates recurrent and attention caches for the hybrid layer schedule")
+    func createsHybridCaches() throws {
+        let configuration = try BailingMoeV3Configuration(
+            jsonData: Data(
+                """
+                {
+                  "architectures": ["BailingMoeV3ForCausalLM"],
+                  "model_type": "bailing_hybrid",
+                  "hidden_size": 8,
+                  "intermediate_size": 16,
+                  "num_hidden_layers": 4,
+                  "num_attention_heads": 2,
+                  "num_key_value_heads": 2,
+                  "head_dim": 4,
+                  "vocab_size": 16,
+                  "max_position_embeddings": 64,
+                  "rms_norm_eps": 0.000001,
+                  "rope_theta": 10000,
+                  "tie_word_embeddings": false,
+                  "layer_group_size": 4,
+                  "short_conv_kernel_size": 4,
+                  "no_kda_lora": true,
+                  "kda_safe_gate": true,
+                  "kda_lower_bound": -5,
+                  "gated_attention_proj_granularity_type": "head_wise",
+                  "qk_head_dim": 4,
+                  "qk_nope_head_dim": 2,
+                  "qk_rope_head_dim": 2,
+                  "v_head_dim": 4,
+                  "q_lora_rank": 2,
+                  "kv_lora_rank": 4,
+                  "rope_interleave": true,
+                  "use_qk_norm": true,
+                  "first_k_dense_replace": 1,
+                  "num_experts": 4,
+                  "num_experts_per_tok": 1,
+                  "num_shared_experts": 1,
+                  "moe_intermediate_size": 4,
+                  "moe_shared_expert_intermediate_size": 4,
+                  "n_group": 2,
+                  "topk_group": 1,
+                  "norm_topk_prob": true,
+                  "routed_scaling_factor": 1,
+                  "moe_router_enable_expert_bias": true
+                }
+                """.utf8
+            )
+        )
+
+        let caches = BailingMoeV3Model(configuration).newCache(parameters: nil)
+
+        #expect(caches.count == 4)
+        #expect(caches[0] is MambaCache)
+        #expect(caches[1] is MambaCache)
+        #expect(caches[2] is MambaCache)
+        #expect(caches[3] is KVCacheSimple)
     }
 }
