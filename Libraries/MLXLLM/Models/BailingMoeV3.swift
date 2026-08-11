@@ -247,6 +247,53 @@ private func bailingMoeV3L2Normalize(_ x: MLXArray) -> MLXArray {
     return x * (meanSquares + 1e-6).rsqrt()
 }
 
+/// Build the single-token KDA graph used during autoregressive decode.
+///
+/// Prefill still uses the dedicated SIMD recurrence kernel below.  Decode is a
+/// different workload: every layer receives exactly one token, so the cost is
+/// dominated by launching the normalization, decay gate, delta update, and
+/// reductions as separate MLX operations.  MLX's compiler can fuse this fixed
+/// graph while retaining the same FP32 recurrent state as the reference path.
+private func makeBailingMoeV3KDADecodeStep(
+    safeGate: Bool
+) -> @Sendable ([MLXArray]) -> [MLXArray] {
+    compile(shapeless: true) { inputs in
+        let q = inputs[0]
+        let k = inputs[1]
+        let v = inputs[2].asType(.float32)
+        let decayInput = inputs[3].asType(.float32)
+        let betaLogits = inputs[4].asType(.float32)
+        var state = inputs[5]
+        let aExp = inputs[6].reshaped(1, q.dim(1), 1)
+        let dt = inputs[7].reshaped(1, q.dim(1), q.dim(2))
+        let qScale = inputs[8]
+        let lowerBound = inputs[9]
+
+        let normalizedQ = bailingMoeV3L2Normalize(q) * qScale
+        let normalizedK = bailingMoeV3L2Normalize(k)
+        let beta = MLXNN.sigmoid(betaLogits)
+        let gateInput = decayInput + dt
+        let logDecay: MLXArray
+        if safeGate {
+            logDecay = MLXNN.sigmoid(aExp * gateInput) * lowerBound
+        } else {
+            logDecay = -(aExp * MLXNN.softplus(gateInput))
+        }
+        let decay = exp(logDecay)
+
+        let keyExpanded = expandedDimensions(normalizedK, axis: -2)
+        state = state * expandedDimensions(decay, axis: -2)
+        let memory = (state * keyExpanded).sum(axis: -1)
+        let delta = (v - memory) * expandedDimensions(beta, axis: -1)
+        state = state + keyExpanded * expandedDimensions(delta, axis: -1)
+        let output = (state * expandedDimensions(normalizedQ, axis: -2)).sum(axis: -1)
+        return [output.asType(q.dtype), state]
+    }
+}
+
+private let bailingMoeV3KDADecodeStepSafe = makeBailingMoeV3KDADecodeStep(safeGate: true)
+private let bailingMoeV3KDADecodeStepSoftplus = makeBailingMoeV3KDADecodeStep(safeGate: false)
+
 private func bailingMoeV3InterleavedToHalf(_ x: MLXArray) -> MLXArray {
     let dimension = x.dim(-1)
     precondition(dimension.isMultiple(of: 2), "Rotary dimensions must be even")
@@ -358,8 +405,68 @@ private class BailingMoeV3DenseMLP: Module, UnaryLayer {
     }
 }
 
+private func bailingMoeV3RouteTopK(
+    scores: MLXArray,
+    routingScores: MLXArray,
+    configuration: BailingMoeV3Configuration
+) -> (indices: MLXArray, weights: MLXArray) {
+    let expertsPerGroup = configuration.numExperts / configuration.nGroup
+    let grouped = routingScores.reshaped(
+        1, 1, configuration.nGroup, expertsPerGroup)
+
+    let groupTop2 = argPartition(-grouped, kth: 1, axis: -1)[.ellipsis, ..<2]
+    let groupScores = takeAlong(grouped, groupTop2, axis: -1).sum(axis: -1)
+    let groupIndices = argPartition(
+        -groupScores, kth: configuration.topkGroup - 1, axis: -1
+    )[
+        .ellipsis, ..<configuration.topkGroup
+    ]
+
+    let groupGather = repeated(
+        expandedDimensions(groupIndices, axis: -1), count: expertsPerGroup, axis: -1)
+    let candidateScores = takeAlong(grouped, groupGather, axis: 2).flattened(
+        start: -2, end: -1)
+    let localIDs = MLXArray(0 ..< expertsPerGroup).reshaped(1, 1, 1, expertsPerGroup)
+    let globalIDs = (
+        groupGather * expertsPerGroup + localIDs
+    ).flattened(start: -2, end: -1)
+    let selectedCandidates = argPartition(
+        -candidateScores, kth: configuration.numExpertsPerToken - 1, axis: -1
+    )[
+        .ellipsis, ..<configuration.numExpertsPerToken
+    ]
+    let indices = takeAlong(globalIDs, selectedCandidates, axis: -1)
+    var weights = takeAlong(scores, indices, axis: -1)
+    if configuration.normTopkProb, configuration.numExpertsPerToken > 1 {
+        weights = weights / (weights.sum(axis: -1, keepDims: true) + 1e-20)
+    }
+    return (indices, weights * configuration.routedScalingFactor)
+}
+
+private func makeBailingMoeV3DecodeRouter(
+    _ configuration: BailingMoeV3Configuration
+) -> @Sendable ([MLXArray]) -> [MLXArray] {
+    compile(shapeless: true) { inputs in
+        let scores = MLXNN.sigmoid(inputs[0].asType(.float32))
+        let routingScores: MLXArray
+        if configuration.moeRouterEnableExpertBias {
+            routingScores = scores + inputs[1].asType(.float32).reshaped(
+                1, 1, configuration.numExperts)
+        } else {
+            routingScores = scores
+        }
+        let route = bailingMoeV3RouteTopK(
+            scores: scores,
+            routingScores: routingScores,
+            configuration: configuration
+        )
+        return [route.indices, route.weights]
+    }
+}
+
 private class BailingMoeV3Gate: Module {
     let configuration: BailingMoeV3Configuration
+    private let fusedDecodeRouter: @Sendable ([MLXArray]) -> [MLXArray]
 
     // The outer sparse-MoE module owns `mlp.gate`; the projection itself is
     // nested below it and receives the converted Hugging Face weight name.
@@ -368,14 +475,28 @@ private class BailingMoeV3Gate: Module {
 
     init(_ configuration: BailingMoeV3Configuration) {
         self.configuration = configuration
+        self.fusedDecodeRouter = makeBailingMoeV3DecodeRouter(configuration)
         _gateProj.wrappedValue = Linear(
             configuration.hiddenSize, configuration.numExperts, bias: false)
         _expertBias.wrappedValue = MLXArray.zeros([configuration.numExperts])
     }
 
     func select(_ x: MLXArray) -> (indices: MLXArray, weights: MLXArray) {
-        let expertsPerGroup = configuration.numExperts / configuration.nGroup
+        // Router logits remain a regular matmul.  For B=L=1, compile the
+        // grouped top-k data-movement graph once and reuse it on every decode
+        // step.  This removes the repeated host graph construction and fuses
+        // the small sigmoid/reshape/take/normalization sequence.
         let logits = gateProj(x)
+        if x.dim(0) == 1, x.dim(1) == 1,
+            configuration.headDim.isMultiple(of: 32) {
+            let inputs = configuration.moeRouterEnableExpertBias
+                ? [logits, expertBias]
+                : [logits]
+            let outputs = fusedDecodeRouter(inputs)
+            return (indices: outputs[0], weights: outputs[1])
+        }
+
+        let expertsPerGroup = configuration.numExperts / configuration.nGroup
         let scores = MLXNN.sigmoid(logits.asType(.float32))
         let routingScores = configuration.moeRouterEnableExpertBias
             ? scores + expertBias.asType(.float32)
@@ -516,9 +637,6 @@ private class BailingMoeV3KDAAttention: Module, BailingMoeV3Attention {
         let v = MLXNN.silu(vConv(projectedParts[2])).reshaped(
             batch, length, configuration.numAttentionHeads, configuration.headDim)
 
-        let normalizedQ = bailingMoeV3L2Normalize(q)
-            * Float(1.0 / sqrt(Double(configuration.headDim)))
-        let normalizedK = bailingMoeV3L2Normalize(k)
         let fbg = fbgProj(x)
         let fbgParts = split(
             fbg,
@@ -527,18 +645,9 @@ private class BailingMoeV3KDAAttention: Module, BailingMoeV3Attention {
         )
         let decayInput = fbgParts[0].reshaped(
             batch, length, configuration.numAttentionHeads, configuration.headDim).asType(.float32)
-        let beta = MLXNN.sigmoid(
-            fbgParts[1].reshaped(batch, length, configuration.numAttentionHeads).asType(.float32))
         let aExp = exp(aLog.asType(.float32)).reshaped(1, 1, configuration.numAttentionHeads, 1)
         let dt = dtBias.asType(.float32).reshaped(
             1, 1, configuration.numAttentionHeads, configuration.headDim)
-        let logDecay: MLXArray
-        if configuration.kdaSafeGate {
-            logDecay = MLXNN.sigmoid(aExp * (decayInput + dt)) * configuration.kdaLowerBound
-        } else {
-            logDecay = -(aExp * MLXNN.softplus(decayInput + dt))
-        }
-        let decay = exp(logDecay)
 
         // KDA keeps a [value, key] state matrix. Ling's feature-wise decay
         // applies to the key axis, never to the value axis. Use the common
@@ -549,36 +658,72 @@ private class BailingMoeV3KDAAttention: Module, BailingMoeV3Attention {
             dtype: .float32
         )
         let recurrence: (output: MLXArray, state: MLXArray)
-        if configuration.headDim.isMultiple(of: 32) {
-            recurrence = gatedDeltaFeatureDecay(
-                q: normalizedQ,
-                k: normalizedK,
-                v: v,
-                decay: decay,
-                beta: beta,
-                state: state
+        if length == 1, configuration.headDim.isMultiple(of: 32) {
+            let decodeStep = configuration.kdaSafeGate
+                ? bailingMoeV3KDADecodeStepSafe
+                : bailingMoeV3KDADecodeStepSoftplus
+            let outputs = decodeStep([
+                q.squeezed(axis: 1),
+                k.squeezed(axis: 1),
+                v.squeezed(axis: 1),
+                decayInput.squeezed(axis: 1),
+                fbgParts[1].reshaped(batch, length, configuration.numAttentionHeads)
+                    .squeezed(axis: 1),
+                state,
+                aExp.reshaped(configuration.numAttentionHeads),
+                dt.reshaped(configuration.numAttentionHeads, configuration.headDim),
+                MLXArray(Float(1.0 / sqrt(Double(configuration.headDim)))),
+                MLXArray(configuration.kdaLowerBound),
+            ])
+            recurrence = (
+                output: outputs[0].expandedDimensions(axis: 1),
+                state: outputs[1]
             )
         } else {
-            // Keep the reference path for small synthetic/test configurations
-            // that cannot satisfy the SIMD kernel's 32-wide lane contract.
-            var fallbackState = state
-            var outputs: [MLXArray] = []
-            outputs.reserveCapacity(length)
-            for token in 0 ..< length {
-                let qToken = normalizedQ[0..., token, 0..., 0...]
-                let kToken = normalizedK[0..., token, 0..., 0...]
-                let vToken = v[0..., token, 0..., 0...].asType(.float32)
-                let decayToken = decay[0..., token, 0..., 0...]
-                let betaToken = beta[0..., token, 0...]
-                let keyExpanded = expandedDimensions(kToken, axis: -2)
-                fallbackState = fallbackState * expandedDimensions(decayToken, axis: -2)
-                let memory = (fallbackState * keyExpanded).sum(axis: -1)
-                let delta = (vToken - memory) * expandedDimensions(betaToken, axis: -1)
-                fallbackState = fallbackState + keyExpanded * expandedDimensions(delta, axis: -1)
-                let output = (fallbackState * expandedDimensions(qToken, axis: -2)).sum(axis: -1)
-                outputs.append(expandedDimensions(output.asType(x.dtype), axis: 1))
+            let normalizedQ = bailingMoeV3L2Normalize(q)
+                * Float(1.0 / sqrt(Double(configuration.headDim)))
+            let normalizedK = bailingMoeV3L2Normalize(k)
+            let beta = MLXNN.sigmoid(
+                fbgParts[1].reshaped(batch, length, configuration.numAttentionHeads)
+                    .asType(.float32))
+            let logDecay: MLXArray
+            if configuration.kdaSafeGate {
+                logDecay = MLXNN.sigmoid(aExp * (decayInput + dt)) * configuration.kdaLowerBound
+            } else {
+                logDecay = -(aExp * MLXNN.softplus(decayInput + dt))
             }
-            recurrence = (output: concatenated(outputs, axis: 1), state: fallbackState)
+            let decay = exp(logDecay)
+            if configuration.headDim.isMultiple(of: 32) {
+                recurrence = gatedDeltaFeatureDecay(
+                    q: normalizedQ,
+                    k: normalizedK,
+                    v: v,
+                    decay: decay,
+                    beta: beta,
+                    state: state
+                )
+            } else {
+                // Keep the reference path for small synthetic/test configurations
+                // that cannot satisfy the SIMD kernel's 32-wide lane contract.
+                var fallbackState = state
+                var outputs: [MLXArray] = []
+                outputs.reserveCapacity(length)
+                for token in 0 ..< length {
+                    let qToken = normalizedQ[0..., token, 0..., 0...]
+                    let kToken = normalizedK[0..., token, 0..., 0...]
+                    let vToken = v[0..., token, 0..., 0...].asType(.float32)
+                    let decayToken = decay[0..., token, 0..., 0...]
+                    let betaToken = beta[0..., token, 0...]
+                    let keyExpanded = expandedDimensions(kToken, axis: -2)
+                    fallbackState = fallbackState * expandedDimensions(decayToken, axis: -2)
+                    let memory = (fallbackState * keyExpanded).sum(axis: -1)
+                    let delta = (vToken - memory) * expandedDimensions(betaToken, axis: -1)
+                    fallbackState = fallbackState + keyExpanded * expandedDimensions(delta, axis: -1)
+                    let output = (fallbackState * expandedDimensions(qToken, axis: -2)).sum(axis: -1)
+                    outputs.append(expandedDimensions(output.asType(x.dtype), axis: 1))
+                }
+                recurrence = (output: concatenated(outputs, axis: 1), state: fallbackState)
+            }
         }
 
         if let cache {
