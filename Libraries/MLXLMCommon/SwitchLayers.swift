@@ -163,6 +163,7 @@ public class FusedGateUpSwitchGLU: Module {
     private var decodeQuantizedWeights:
         (gateWeight: MLXArray, gateScales: MLXArray, gateBiases: MLXArray?,
         downWeight: MLXArray, downScales: MLXArray, downBiases: MLXArray?)?
+    private let decodeQuantizedWeightsLock = NSLock()
 
     public init(
         inputDims: Int,
@@ -224,6 +225,7 @@ public class FusedGateUpSwitchGLU: Module {
         if let decodeQuantization,
             !doSort, gateUpProj.bias == nil, downProj.bias == nil,
             indices.dim(0) == 1, indices.dim(1) == 1 {
+            decodeQuantizedWeightsLock.lock()
             if decodeQuantizedWeights == nil {
                 let gate = MLX.quantized(
                     gateUpProj.weight,
@@ -241,6 +243,7 @@ public class FusedGateUpSwitchGLU: Module {
                 )
             }
             let quantized = decodeQuantizedWeights!
+            decodeQuantizedWeightsLock.unlock()
             let gateUp = MLX.gatherQuantizedMM(
                 x, quantized.gateWeight, scales: quantized.gateScales,
                 biases: quantized.gateBiases, rhsIndices: idx, transpose: true,
