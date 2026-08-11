@@ -570,7 +570,12 @@ private class BailingMoeV3SparseMoeBlock: Module, UnaryLayer {
             inputDims: configuration.hiddenSize,
             hiddenDims: configuration.moeIntermediateSize,
             numExperts: configuration.numExperts,
-            bias: false
+            bias: false,
+            // Ling's BF16 checkpoint is imported as-is, but single-token
+            // expert decode benefits from the same MXFP8 path used by the
+            // native MLX runner. Prefill keeps the original BF16 projections.
+            decodeQuantization: SwitchDecodeQuantization(
+                groupSize: 32, bits: 8, mode: .mxfp8)
         )
         _gate.wrappedValue = BailingMoeV3Gate(configuration)
         if configuration.numSharedExperts > 0 {

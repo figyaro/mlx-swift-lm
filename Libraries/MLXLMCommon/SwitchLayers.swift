@@ -130,6 +130,23 @@ public class SwitchGLU: Module {
 
 // MARK: - FusedGateUpSwitchGLU
 
+/// Optional decode-only weight compression for routed expert projections.
+///
+/// Single-token MoE decode is launch-bound when every selected expert is kept
+/// in BF16. A model can opt into a cached quantized representation without
+/// changing its prefill path or checkpoint format.
+public struct SwitchDecodeQuantization: Sendable {
+    public let groupSize: Int
+    public let bits: Int
+    public let mode: QuantizationMode
+
+    public init(groupSize: Int, bits: Int, mode: QuantizationMode) {
+        self.groupSize = groupSize
+        self.bits = bits
+        self.mode = mode
+    }
+}
+
 /// SwitchGLU variant for models that ship a single fused `gate_up_proj` weight
 /// of shape `[numExperts, 2*hiddenDims, inputDims]` instead of separate
 /// `gate_proj` / `up_proj`. Used by Gemma 4 26B MoE.
@@ -142,18 +159,24 @@ public class FusedGateUpSwitchGLU: Module {
     let numExperts: Int
     let activation: (MLXArray) -> MLXArray
     let activationProduct: (@Sendable (MLXArray, MLXArray) -> MLXArray)?
+    let decodeQuantization: SwitchDecodeQuantization?
+    private var decodeQuantizedWeights:
+        (gateWeight: MLXArray, gateScales: MLXArray, gateBiases: MLXArray?,
+        downWeight: MLXArray, downScales: MLXArray, downBiases: MLXArray?)?
 
     public init(
         inputDims: Int,
         hiddenDims: Int,
         numExperts: Int,
-        bias: Bool = false
+        bias: Bool = false,
+        decodeQuantization: SwitchDecodeQuantization? = nil
     ) {
         self.inputDims = inputDims
         self.hiddenDims = hiddenDims
         self.numExperts = numExperts
         self.activation = MLXNN.silu
         self.activationProduct = compiledSiluProduct
+        self.decodeQuantization = decodeQuantization
 
         self._gateUpProj.wrappedValue = SwitchLinear(
             inputDims: inputDims, outputDims: 2 * hiddenDims, numExperts: numExperts, bias: bias)
@@ -168,13 +191,15 @@ public class FusedGateUpSwitchGLU: Module {
         hiddenDims: Int,
         numExperts: Int,
         activation: @escaping (MLXArray) -> MLXArray,
-        bias: Bool = false
+        bias: Bool = false,
+        decodeQuantization: SwitchDecodeQuantization? = nil
     ) {
         self.inputDims = inputDims
         self.hiddenDims = hiddenDims
         self.numExperts = numExperts
         self.activation = activation
         self.activationProduct = nil
+        self.decodeQuantization = decodeQuantization
 
         self._gateUpProj.wrappedValue = SwitchLinear(
             inputDims: inputDims, outputDims: 2 * hiddenDims, numExperts: numExperts, bias: bias)
@@ -194,6 +219,50 @@ public class FusedGateUpSwitchGLU: Module {
 
         if doSort {
             (x, idx, inverseOrder) = gatherSort(x: x, indices: indices)
+        }
+
+        if let decodeQuantization,
+            !doSort, gateUpProj.bias == nil, downProj.bias == nil,
+            indices.dim(0) == 1, indices.dim(1) == 1 {
+            if decodeQuantizedWeights == nil {
+                let gate = MLX.quantized(
+                    gateUpProj.weight,
+                    groupSize: decodeQuantization.groupSize,
+                    bits: decodeQuantization.bits,
+                    mode: decodeQuantization.mode)
+                let down = MLX.quantized(
+                    downProj.weight,
+                    groupSize: decodeQuantization.groupSize,
+                    bits: decodeQuantization.bits,
+                    mode: decodeQuantization.mode)
+                decodeQuantizedWeights = (
+                    gateWeight: gate.0, gateScales: gate.1, gateBiases: gate.2,
+                    downWeight: down.0, downScales: down.1, downBiases: down.2
+                )
+            }
+            let quantized = decodeQuantizedWeights!
+            let gateUp = MLX.gatherQuantizedMM(
+                x, quantized.gateWeight, scales: quantized.gateScales,
+                biases: quantized.gateBiases, rhsIndices: idx, transpose: true,
+                groupSize: decodeQuantization.groupSize,
+                bits: decodeQuantization.bits,
+                mode: decodeQuantization.mode,
+                sortedIndices: false)
+            let parts = MLX.split(gateUp, parts: 2, axis: -1)
+            let activated =
+                if let activationProduct {
+                    activationProduct(parts[0], parts[1])
+                } else {
+                    activation(parts[0]) * parts[1]
+                }
+            let down = MLX.gatherQuantizedMM(
+                activated, quantized.downWeight, scales: quantized.downScales,
+                biases: quantized.downBiases, rhsIndices: idx, transpose: true,
+                groupSize: decodeQuantization.groupSize,
+                bits: decodeQuantization.bits,
+                mode: decodeQuantization.mode,
+                sortedIndices: false)
+            return MLX.squeezed(down, axis: -2)
         }
 
         let gateUp = gateUpProj(x, idx, sortedIndices: doSort)
