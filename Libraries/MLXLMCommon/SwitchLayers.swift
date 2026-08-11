@@ -237,6 +237,18 @@ public class FusedGateUpSwitchGLU: Module {
                     groupSize: decodeQuantization.groupSize,
                     bits: decodeQuantization.bits,
                     mode: decodeQuantization.mode)
+                // MLXArray graphs are lazy and are not safe to publish for
+                // concurrent evaluation. Materialize the shared weights while
+                // the initialization lock is held so each session only reads
+                // immutable, evaluated tensors during decode.
+                var quantizedArrays = [gate.0, gate.1, down.0, down.1]
+                if let gateBiases = gate.2 {
+                    quantizedArrays.append(gateBiases)
+                }
+                if let downBiases = down.2 {
+                    quantizedArrays.append(downBiases)
+                }
+                eval(quantizedArrays)
                 decodeQuantizedWeights = (
                     gateWeight: gate.0, gateScales: gate.1, gateBiases: gate.2,
                     downWeight: down.0, downScales: down.1, downBiases: down.2
