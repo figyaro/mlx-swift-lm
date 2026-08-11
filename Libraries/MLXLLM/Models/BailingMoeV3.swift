@@ -696,9 +696,7 @@ public class BailingMoeV3Model: Module, LLMModel, KVCacheDimensionProvider {
         for layer in 0 ..< configuration.numHiddenLayers {
             let prefix = "model.layers.\(layer)"
 
-            if configuration.attentionKind(forLayer: layer) == .mla,
-                let gateWeight = sanitized.removeValue(forKey: "\(prefix).mlp.gate.weight")
-            {
+            if let gateWeight = sanitized.removeValue(forKey: "\(prefix).mlp.gate.weight") {
                 sanitized["\(prefix).mlp.gate.gate_proj.weight"] = gateWeight
             }
 
