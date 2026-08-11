@@ -1,6 +1,7 @@
 import Foundation
 import Testing
 
+import MLX
 @testable import MLXLLM
 import MLXLMCommon
 
@@ -155,5 +156,11 @@ struct BailingMoeV3Tests {
         #expect(caches[1] is MambaCache)
         #expect(caches[2] is MambaCache)
         #expect(caches[3] is KVCacheSimple)
+
+        let model = BailingMoeV3Model(configuration)
+        let logits = model(
+            MLXArray([1, 2] as [Int32]).reshaped(1, 2), cache: model.newCache(parameters: nil))
+        eval(logits)
+        #expect(logits.shape == [1, 2, 16])
     }
 }
