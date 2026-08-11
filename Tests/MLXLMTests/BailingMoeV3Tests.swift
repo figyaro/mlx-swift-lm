@@ -158,6 +158,17 @@ struct BailingMoeV3Tests {
         #expect(caches[3] is KVCacheSimple)
 
         let model = BailingMoeV3Model(configuration)
+
+        let gateWeight = MLXArray.zeros([configuration.numExperts, configuration.hiddenSize])
+        let sanitized = model.sanitize(weights: [
+            "model.layers.1.mlp.gate.weight": gateWeight,
+            "model.layers.3.mlp.gate.weight": gateWeight,
+        ])
+        #expect(sanitized["model.layers.1.mlp.gate.weight"] == nil)
+        #expect(sanitized["model.layers.1.mlp.gate.gate_proj.weight"] != nil)
+        #expect(sanitized["model.layers.3.mlp.gate.weight"] == nil)
+        #expect(sanitized["model.layers.3.mlp.gate.gate_proj.weight"] != nil)
+
         let logits = model(
             MLXArray([1, 2] as [Int32]).reshaped(1, 2), cache: model.newCache(parameters: nil))
         eval(logits)
