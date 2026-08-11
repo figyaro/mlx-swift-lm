@@ -450,23 +450,51 @@ private class BailingMoeV3KDAAttention: Module, BailingMoeV3Attention {
         }
         let decay = exp(logDecay)
 
-        let (recurrentOutput, state) = gatedDeltaFeatureDecayUpdate(
-            q: normalizedQ,
-            k: normalizedK,
-            v: v,
-            decay: decay,
-            beta: beta,
-            state: cache?[1]
-        )
+        let recurrence: (output: MLXArray, state: MLXArray)
+        if configuration.headDim.isMultiple(of: 32) {
+            let (output, state) = gatedDeltaFeatureDecayUpdate(
+                q: normalizedQ,
+                k: normalizedK,
+                v: v,
+                decay: decay,
+                beta: beta,
+                state: cache?[1]
+            )
+            recurrence = (output, state)
+        } else {
+            // Tiny synthetic configurations used in tests need a generic path;
+            // production Ling uses headDim 128 and takes the Metal kernel above.
+            var state = cache?[1] ?? MLXArray.zeros(
+                [batch, configuration.numAttentionHeads, configuration.headDim, configuration.headDim],
+                dtype: .float32
+            )
+            var outputs: [MLXArray] = []
+            outputs.reserveCapacity(length)
+            for token in 0 ..< length {
+                let qToken = normalizedQ[0..., token, 0..., 0...]
+                let kToken = normalizedK[0..., token, 0..., 0...]
+                let vToken = v[0..., token, 0..., 0...].asType(.float32)
+                let decayToken = decay[0..., token, 0..., 0...]
+                let betaToken = beta[0..., token, 0...]
+                let keyExpanded = expandedDimensions(kToken, axis: -2)
+                state = state * expandedDimensions(decayToken, axis: -1)
+                let memory = (state * keyExpanded).sum(axis: -1)
+                let delta = (vToken - memory) * expandedDimensions(betaToken, axis: -1)
+                state = state + keyExpanded * expandedDimensions(delta, axis: -1)
+                let output = (state * expandedDimensions(qToken, axis: -2)).sum(axis: -1)
+                outputs.append(expandedDimensions(output.asType(x.dtype), axis: 1))
+            }
+            recurrence = (concatenated(outputs, axis: 1), state)
+        }
 
         if let cache {
             let start = max(0, paddedInput.dim(1) - kernelTail)
             cache[0] = contiguous(paddedInput[0..., start..., 0...])
-            cache[1] = state
+            cache[1] = recurrence.state
             cache.advance(length)
         }
 
-        var output = recurrentOutput
+        var output = recurrence.output
         output = oNorm(output)
         let gate = MLXNN.sigmoid(gProj(x).reshaped(
             batch, length, configuration.numAttentionHeads, configuration.headDim).asType(.float32))
