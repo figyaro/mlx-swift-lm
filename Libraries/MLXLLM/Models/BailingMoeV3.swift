@@ -342,19 +342,19 @@ private func bailingMoeV3KDAUpdate(
 }
 
 private class BailingMoeV3DenseMLP: Module, UnaryLayer {
-    @ModuleInfo(key: "gate_proj") var gateProj: Linear
-    @ModuleInfo(key: "up_proj") var upProj: Linear
+    @ModuleInfo(key: "gate_up_proj") var gateUpProj: Linear
     @ModuleInfo(key: "down_proj") var downProj: Linear
 
     init(_ configuration: BailingMoeV3Configuration, intermediateSize: Int? = nil) {
         let intermediateSize = intermediateSize ?? configuration.intermediateSize
-        _gateProj.wrappedValue = Linear(configuration.hiddenSize, intermediateSize, bias: false)
-        _upProj.wrappedValue = Linear(configuration.hiddenSize, intermediateSize, bias: false)
+        _gateUpProj.wrappedValue = Linear(
+            configuration.hiddenSize, 2 * intermediateSize, bias: false)
         _downProj.wrappedValue = Linear(intermediateSize, configuration.hiddenSize, bias: false)
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        downProj(MLXNN.silu(gateProj(x)) * upProj(x))
+        let gateUp = split(gateUpProj(x), parts: 2, axis: -1)
+        return downProj(compiledSiluProduct(gateUp[0], gateUp[1]))
     }
 }
 
@@ -416,13 +416,13 @@ private class BailingMoeV3Gate: Module {
 private class BailingMoeV3SparseMoeBlock: Module, UnaryLayer {
     let configuration: BailingMoeV3Configuration
 
-    @ModuleInfo(key: "switch_mlp") var switchMLP: SwitchGLU
+    @ModuleInfo(key: "switch_mlp") var switchMLP: FusedGateUpSwitchGLU
     @ModuleInfo(key: "gate") var gate: BailingMoeV3Gate
     @ModuleInfo(key: "shared_experts") var sharedExperts: BailingMoeV3DenseMLP?
 
     init(_ configuration: BailingMoeV3Configuration) {
         self.configuration = configuration
-        _switchMLP.wrappedValue = SwitchGLU(
+        _switchMLP.wrappedValue = FusedGateUpSwitchGLU(
             inputDims: configuration.hiddenSize,
             hiddenDims: configuration.moeIntermediateSize,
             numExperts: configuration.numExperts,
@@ -459,12 +459,11 @@ private protocol BailingMoeV3Attention: Module {
 private class BailingMoeV3KDAAttention: Module, BailingMoeV3Attention {
     let configuration: BailingMoeV3Configuration
 
-    @ModuleInfo(key: "q_proj") var qProj: Linear
-    @ModuleInfo(key: "k_proj") var kProj: Linear
-    @ModuleInfo(key: "v_proj") var vProj: Linear
-    @ModuleInfo(key: "f_proj") var fProj: Linear
-    @ModuleInfo(key: "b_proj") var bProj: Linear
-    @ModuleInfo(key: "g_proj") var gProj: Linear
+    // Ling's decode path is dominated by six small input projections.  Keep
+    // the checkpoint-compatible projections as one QKV and one FBG linear so
+    // a single-token decode uses two matmuls instead of six.
+    @ModuleInfo(key: "qkv_proj") var qkvProj: Linear
+    @ModuleInfo(key: "fbg_proj") var fbgProj: Linear
     @ModuleInfo(key: "o_proj") var oProj: Linear
     @ModuleInfo(key: "q_conv1d") var qConv: Conv1d
     @ModuleInfo(key: "k_conv1d") var kConv: Conv1d
@@ -476,12 +475,13 @@ private class BailingMoeV3KDAAttention: Module, BailingMoeV3Attention {
     init(_ configuration: BailingMoeV3Configuration) {
         self.configuration = configuration
         let projectionSize = configuration.projectionSize
-        _qProj.wrappedValue = Linear(configuration.hiddenSize, projectionSize, bias: false)
-        _kProj.wrappedValue = Linear(configuration.hiddenSize, projectionSize, bias: false)
-        _vProj.wrappedValue = Linear(configuration.hiddenSize, projectionSize, bias: false)
-        _fProj.wrappedValue = Linear(configuration.hiddenSize, projectionSize, bias: false)
-        _bProj.wrappedValue = Linear(configuration.hiddenSize, configuration.numAttentionHeads, bias: false)
-        _gProj.wrappedValue = Linear(configuration.hiddenSize, projectionSize, bias: false)
+        _qkvProj.wrappedValue = Linear(
+            configuration.hiddenSize, 3 * projectionSize, bias: false)
+        _fbgProj.wrappedValue = Linear(
+            configuration.hiddenSize,
+            2 * projectionSize + configuration.numAttentionHeads,
+            bias: false
+        )
         _oProj.wrappedValue = Linear(projectionSize, configuration.hiddenSize, bias: false)
         _qConv.wrappedValue = Conv1d(
             inputChannels: projectionSize, outputChannels: projectionSize,
@@ -504,7 +504,7 @@ private class BailingMoeV3KDAAttention: Module, BailingMoeV3Attention {
         let (batch, length) = (x.dim(0), x.dim(1))
         let projectionSize = configuration.projectionSize
         let kernelTail = configuration.shortConvKernelSize - 1
-        let projected = concatenated([qProj(x), kProj(x), vProj(x)], axis: -1)
+        let projected = qkvProj(x)
         let convState = cache?[0] ?? MLXArray.zeros(
             [batch, kernelTail, 3 * projectionSize], dtype: x.dtype)
         let paddedInput = concatenated([convState, projected], axis: 1)
@@ -519,10 +519,16 @@ private class BailingMoeV3KDAAttention: Module, BailingMoeV3Attention {
         let normalizedQ = bailingMoeV3L2Normalize(q)
             * Float(1.0 / sqrt(Double(configuration.headDim)))
         let normalizedK = bailingMoeV3L2Normalize(k)
-        let decayInput = fProj(x).reshaped(
+        let fbg = fbgProj(x)
+        let fbgParts = split(
+            fbg,
+            indices: [projectionSize, projectionSize + configuration.numAttentionHeads],
+            axis: -1
+        )
+        let decayInput = fbgParts[0].reshaped(
             batch, length, configuration.numAttentionHeads, configuration.headDim).asType(.float32)
         let beta = MLXNN.sigmoid(
-            bProj(x).reshaped(batch, length, configuration.numAttentionHeads).asType(.float32))
+            fbgParts[1].reshaped(batch, length, configuration.numAttentionHeads).asType(.float32))
         let aExp = exp(aLog.asType(.float32)).reshaped(1, 1, configuration.numAttentionHeads, 1)
         let dt = dtBias.asType(.float32).reshaped(
             1, 1, configuration.numAttentionHeads, configuration.headDim)
@@ -584,7 +590,7 @@ private class BailingMoeV3KDAAttention: Module, BailingMoeV3Attention {
 
         var output = recurrence.output
         output = oNorm(output)
-        let gate = MLXNN.sigmoid(gProj(x).reshaped(
+        let gate = MLXNN.sigmoid(fbgParts[2].reshaped(
             batch, length, configuration.numAttentionHeads, configuration.headDim).asType(.float32))
         output = (output.asType(.float32) * gate).asType(x.dtype)
         return oProj(output.reshaped(batch, length, projectionSize))
@@ -799,11 +805,42 @@ public class BailingMoeV3Model: Module, LLMModel, KVCacheDimensionProvider {
         for layer in 0 ..< configuration.numHiddenLayers {
             let prefix = "model.layers.\(layer)"
 
+            // The upstream checkpoint stores these projections separately.  The
+            // runtime modules intentionally use row-fused weights so decode can
+            // replace several tiny matmuls with one wider matmul.  This runs
+            // before optional quantization, so the fused tensor is quantized by
+            // the normal model conversion path when a quantized variant is made.
+            func fuseRows(_ keys: [String], into outputKey: String) {
+                guard keys.allSatisfy({ sanitized[$0] != nil }) else { return }
+                let tensors = keys.compactMap { sanitized[$0] }
+                sanitized[outputKey] = concatenated(tensors, axis: 0)
+                for key in keys {
+                    sanitized[key] = nil
+                }
+            }
+
             if let gateWeight = sanitized.removeValue(forKey: "\(prefix).mlp.gate.weight") {
                 sanitized["\(prefix).mlp.gate.gate_proj.weight"] = gateWeight
             }
 
             if configuration.attentionKind(forLayer: layer) == .kda {
+                let attentionPrefix = "\(prefix).attention"
+                fuseRows(
+                    [
+                        "\(attentionPrefix).q_proj.weight",
+                        "\(attentionPrefix).k_proj.weight",
+                        "\(attentionPrefix).v_proj.weight",
+                    ],
+                    into: "\(attentionPrefix).qkv_proj.weight"
+                )
+                fuseRows(
+                    [
+                        "\(attentionPrefix).f_proj.weight",
+                        "\(attentionPrefix).b_proj.weight",
+                        "\(attentionPrefix).g_proj.weight",
+                    ],
+                    into: "\(attentionPrefix).fbg_proj.weight"
+                )
                 for projection in ["q_conv1d", "k_conv1d", "v_conv1d"] {
                     let key = "\(prefix).attention.\(projection).weight"
                     if let weight = sanitized[key], weight.ndim == 3, weight.dim(1) == 1 {
@@ -812,19 +849,47 @@ public class BailingMoeV3Model: Module, LLMModel, KVCacheDimensionProvider {
                 }
             }
 
+            fuseRows(
+                ["\(prefix).mlp.gate_proj.weight", "\(prefix).mlp.up_proj.weight"],
+                into: "\(prefix).mlp.gate_up_proj.weight"
+            )
+
             guard layer >= configuration.firstKDenseReplace else { continue }
-            for projection in ["gate_proj", "up_proj", "down_proj"] {
-                let firstKey = "\(prefix).mlp.experts.0.\(projection).weight"
-                guard sanitized[firstKey] != nil else { continue }
-                let keys = (0 ..< configuration.numExperts).map {
-                    "\(prefix).mlp.experts.\($0).\(projection).weight"
+            let expertGateKeys = (0 ..< configuration.numExperts).map {
+                "\(prefix).mlp.experts.\($0).gate_proj.weight"
+            }
+            let expertUpKeys = (0 ..< configuration.numExperts).map {
+                "\(prefix).mlp.experts.\($0).up_proj.weight"
+            }
+            let expertDownKeys = (0 ..< configuration.numExperts).map {
+                "\(prefix).mlp.experts.\($0).down_proj.weight"
+            }
+            if expertGateKeys.allSatisfy({ sanitized[$0] != nil })
+                && expertUpKeys.allSatisfy({ sanitized[$0] != nil }) {
+                let fusedExperts = zip(expertGateKeys, expertUpKeys).map { gateKey, upKey in
+                    concatenated([sanitized[gateKey]!, sanitized[upKey]!], axis: 0)
                 }
-                let expertWeights = keys.compactMap { sanitized[$0] }
-                guard expertWeights.count == configuration.numExperts else { continue }
-                sanitized["\(prefix).mlp.switch_mlp.\(projection).weight"] = stacked(expertWeights)
-                for key in keys {
+                sanitized["\(prefix).mlp.switch_mlp.gate_up_proj.weight"] = stacked(fusedExperts)
+                for key in expertGateKeys + expertUpKeys {
                     sanitized[key] = nil
                 }
+            }
+            if expertDownKeys.allSatisfy({ sanitized[$0] != nil }) {
+                sanitized["\(prefix).mlp.switch_mlp.down_proj.weight"] = stacked(
+                    expertDownKeys.compactMap { sanitized[$0] })
+                for key in expertDownKeys {
+                    sanitized[key] = nil
+                }
+            }
+
+            if configuration.numSharedExperts > 0 {
+                fuseRows(
+                    [
+                        "\(prefix).mlp.shared_experts.gate_proj.weight",
+                        "\(prefix).mlp.shared_experts.up_proj.weight",
+                    ],
+                    into: "\(prefix).mlp.shared_experts.gate_up_proj.weight"
+                )
             }
         }
         return sanitized
