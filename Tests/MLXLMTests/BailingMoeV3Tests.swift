@@ -169,9 +169,15 @@ struct BailingMoeV3Tests {
         #expect(sanitized["model.layers.3.mlp.gate.weight"] == nil)
         #expect(sanitized["model.layers.3.mlp.gate.gate_proj.weight"] != nil)
 
+        let cache = model.newCache(parameters: nil)
         let logits = model(
-            MLXArray([1, 2] as [Int32]).reshaped(1, 2), cache: model.newCache(parameters: nil))
+            MLXArray([1, 2] as [Int32]).reshaped(1, 2), cache: cache)
         eval(logits)
         #expect(logits.shape == [1, 2, 16])
+
+        // A one-token continuation exercises the fused KDA decode kernel.
+        let decoded = model(MLXArray([3] as [Int32]).reshaped(1, 1), cache: cache)
+        eval(decoded)
+        #expect(decoded.shape == [1, 1, 16])
     }
 }

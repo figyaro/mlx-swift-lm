@@ -257,6 +257,90 @@ private func bailingMoeV3InterleavedToHalf(_ x: MLXArray) -> MLXArray {
     return paired.transposed(axes: axes).reshaped(shape)
 }
 
+// MARK: - Ling KDA decode kernel
+
+/// Fuses a single KDA recurrence step into one Metal dispatch.
+///
+/// Ling-3.0-tiny has eighteen KDA layers.  During token-by-token decoding the
+/// previous implementation expressed each one as a Swift loop over many small
+/// MLX operations (broadcasts, reductions, and state writes).  The operations
+/// are mathematically simple, but their individual kernel launches dominate
+/// decode time on Apple silicon.  This kernel keeps the state in FP32 exactly
+/// as the reference path does, and only changes how the one-token recurrence is
+/// scheduled.
+private func makeBailingMoeV3KDAUpdateKernel() -> MLXFast.MLXFastKernel {
+    let source = """
+        uint index = thread_position_in_grid.x;
+        if (index >= B * H * D) {
+            return;
+        }
+
+        uint valueIndex = index % D;
+        uint headIndex = (index / D) % H;
+        uint batchIndex = index / (H * D);
+        uint vectorOffset = (batchIndex * H + headIndex) * D;
+        uint stateOffset = index * D;
+
+        // state is [batch, head, value, key].  Decay applies to its key axis.
+        float memory = 0.0f;
+        for (uint key = 0; key < D; ++key) {
+            memory += state[stateOffset + key] * k[vectorOffset + key];
+        }
+        float delta = (v[vectorOffset + valueIndex] - memory)
+            * beta[batchIndex * H + headIndex];
+
+        float result = 0.0f;
+        for (uint key = 0; key < D; ++key) {
+            float updated = state[stateOffset + key] * decay[vectorOffset + key]
+                + k[vectorOffset + key] * delta;
+            next_state[stateOffset + key] = updated;
+            result += updated * q[vectorOffset + key];
+        }
+        output[index] = result;
+        """
+
+    return MLXFast.metalKernel(
+        name: "bailing_moe_v3_kda_decode",
+        inputNames: ["q", "k", "v", "decay", "beta", "state"],
+        outputNames: ["output", "next_state"],
+        source: source
+    )
+}
+
+private final class BailingMoeV3KDAKernelManager: Sendable {
+    static let shared = BailingMoeV3KDAKernelManager()
+
+    let updateKernel: MLXFast.MLXFastKernel
+
+    private init() {
+        updateKernel = makeBailingMoeV3KDAUpdateKernel()
+    }
+}
+
+private func bailingMoeV3KDAUpdate(
+    q: MLXArray,
+    k: MLXArray,
+    v: MLXArray,
+    decay: MLXArray,
+    beta: MLXArray,
+    state: MLXArray
+) -> (output: MLXArray, state: MLXArray) {
+    let (batch, heads, dimension) = q.shape3
+    let outputs = BailingMoeV3KDAKernelManager.shared.updateKernel(
+        [q, k, v, decay, beta, state],
+        template: [
+            ("B", batch),
+            ("H", heads),
+            ("D", dimension),
+        ],
+        grid: (batch * heads * dimension, 1, 1),
+        threadGroup: (min(dimension, 256), 1, 1),
+        outputShapes: [[batch, heads, dimension], state.shape],
+        outputDTypes: [.float32, .float32]
+    )
+    return (outputs[0], outputs[1])
+}
+
 private class BailingMoeV3DenseMLP: Module, UnaryLayer {
     @ModuleInfo(key: "gate_proj") var gateProj: Linear
     @ModuleInfo(key: "up_proj") var upProj: Linear
@@ -458,23 +542,41 @@ private class BailingMoeV3KDAAttention: Module, BailingMoeV3Attention {
             [batch, configuration.numAttentionHeads, configuration.headDim, configuration.headDim],
             dtype: .float32
         )
-        var outputs: [MLXArray] = []
-        outputs.reserveCapacity(length)
-        for token in 0 ..< length {
-            let qToken = normalizedQ[0..., token, 0..., 0...]
-            let kToken = normalizedK[0..., token, 0..., 0...]
-            let vToken = v[0..., token, 0..., 0...].asType(.float32)
-            let decayToken = decay[0..., token, 0..., 0...]
-            let betaToken = beta[0..., token, 0...]
-            let keyExpanded = expandedDimensions(kToken, axis: -2)
-            state = state * expandedDimensions(decayToken, axis: -2)
-            let memory = (state * keyExpanded).sum(axis: -1)
-            let delta = (vToken - memory) * expandedDimensions(betaToken, axis: -1)
-            state = state + keyExpanded * expandedDimensions(delta, axis: -1)
-            let output = (state * expandedDimensions(qToken, axis: -2)).sum(axis: -1)
-            outputs.append(expandedDimensions(output.asType(x.dtype), axis: 1))
+        let recurrence: (output: MLXArray, state: MLXArray)
+        if length == 1 {
+            // Decode is the latency-critical case.  Fuse the recurrence to
+            // eliminate the Swift/MLX launch chain while preserving FP32 state.
+            let update = bailingMoeV3KDAUpdate(
+                q: normalizedQ[0..., 0, 0..., 0...],
+                k: normalizedK[0..., 0, 0..., 0...],
+                v: v[0..., 0, 0..., 0...].asType(.float32),
+                decay: decay[0..., 0, 0..., 0...],
+                beta: beta[0..., 0, 0...],
+                state: state
+            )
+            recurrence = (
+                output: expandedDimensions(update.output.asType(x.dtype), axis: 1),
+                state: update.state
+            )
+        } else {
+            var outputs: [MLXArray] = []
+            outputs.reserveCapacity(length)
+            for token in 0 ..< length {
+                let qToken = normalizedQ[0..., token, 0..., 0...]
+                let kToken = normalizedK[0..., token, 0..., 0...]
+                let vToken = v[0..., token, 0..., 0...].asType(.float32)
+                let decayToken = decay[0..., token, 0..., 0...]
+                let betaToken = beta[0..., token, 0...]
+                let keyExpanded = expandedDimensions(kToken, axis: -2)
+                state = state * expandedDimensions(decayToken, axis: -2)
+                let memory = (state * keyExpanded).sum(axis: -1)
+                let delta = (vToken - memory) * expandedDimensions(betaToken, axis: -1)
+                state = state + keyExpanded * expandedDimensions(delta, axis: -1)
+                let output = (state * expandedDimensions(qToken, axis: -2)).sum(axis: -1)
+                outputs.append(expandedDimensions(output.asType(x.dtype), axis: 1))
+            }
+            recurrence = (output: concatenated(outputs, axis: 1), state: state)
         }
-        let recurrence = (output: concatenated(outputs, axis: 1), state: state)
 
         if let cache {
             let start = max(0, paddedInput.dim(1) - kernelTail)
