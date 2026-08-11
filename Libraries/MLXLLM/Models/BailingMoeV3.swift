@@ -535,30 +535,27 @@ private class BailingMoeV3KDAAttention: Module, BailingMoeV3Attention {
         let decay = exp(logDecay)
 
         // KDA keeps a [value, key] state matrix. Ling's feature-wise decay
-        // applies to the key axis, never to the value axis. Keep this pure-MLX
-        // recurrence until a Metal path is proven numerically identical with
-        // production Ling weights.
-        var state = cache?[1] ?? MLXArray.zeros(
+        // applies to the key axis, never to the value axis. Use the common
+        // SIMD Metal recurrence for both prefill and decode; it preserves the
+        // FP32 state while avoiding a Swift loop and per-token MLX launches.
+        let state = cache?[1] ?? MLXArray.zeros(
             [batch, configuration.numAttentionHeads, configuration.headDim, configuration.headDim],
             dtype: .float32
         )
         let recurrence: (output: MLXArray, state: MLXArray)
-        if length == 1 {
-            // Decode is the latency-critical case.  Fuse the recurrence to
-            // eliminate the Swift/MLX launch chain while preserving FP32 state.
-            let update = bailingMoeV3KDAUpdate(
-                q: normalizedQ[0..., 0, 0..., 0...],
-                k: normalizedK[0..., 0, 0..., 0...],
-                v: v[0..., 0, 0..., 0...].asType(.float32),
-                decay: decay[0..., 0, 0..., 0...],
-                beta: beta[0..., 0, 0...],
+        if configuration.headDim.isMultiple(of: 32) {
+            recurrence = gatedDeltaFeatureDecay(
+                q: normalizedQ,
+                k: normalizedK,
+                v: v,
+                decay: decay,
+                beta: beta,
                 state: state
             )
-            recurrence = (
-                output: expandedDimensions(update.output.asType(x.dtype), axis: 1),
-                state: update.state
-            )
         } else {
+            // Keep the reference path for small synthetic/test configurations
+            // that cannot satisfy the SIMD kernel's 32-wide lane contract.
+            var fallbackState = state
             var outputs: [MLXArray] = []
             outputs.reserveCapacity(length)
             for token in 0 ..< length {
@@ -568,14 +565,14 @@ private class BailingMoeV3KDAAttention: Module, BailingMoeV3Attention {
                 let decayToken = decay[0..., token, 0..., 0...]
                 let betaToken = beta[0..., token, 0...]
                 let keyExpanded = expandedDimensions(kToken, axis: -2)
-                state = state * expandedDimensions(decayToken, axis: -2)
-                let memory = (state * keyExpanded).sum(axis: -1)
+                fallbackState = fallbackState * expandedDimensions(decayToken, axis: -2)
+                let memory = (fallbackState * keyExpanded).sum(axis: -1)
                 let delta = (vToken - memory) * expandedDimensions(betaToken, axis: -1)
-                state = state + keyExpanded * expandedDimensions(delta, axis: -1)
-                let output = (state * expandedDimensions(qToken, axis: -2)).sum(axis: -1)
+                fallbackState = fallbackState + keyExpanded * expandedDimensions(delta, axis: -1)
+                let output = (fallbackState * expandedDimensions(qToken, axis: -2)).sum(axis: -1)
                 outputs.append(expandedDimensions(output.asType(x.dtype), axis: 1))
             }
-            recurrence = (output: concatenated(outputs, axis: 1), state: state)
+            recurrence = (output: concatenated(outputs, axis: 1), state: fallbackState)
         }
 
         if let cache {

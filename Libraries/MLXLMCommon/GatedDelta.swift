@@ -252,6 +252,29 @@ private func gatedDeltaFeatureDecayKernel(
     return (outputs[0], outputs[1])
 }
 
+/// Shared entry point for hybrid attention layers whose decay gate is defined
+/// per key feature, such as Ling/Bailing KDA.
+public func gatedDeltaFeatureDecay(
+    q: MLXArray,
+    k: MLXArray,
+    v: MLXArray,
+    decay: MLXArray,
+    beta: MLXArray,
+    state: MLXArray,
+    mask: MLXArray? = nil
+) -> (output: MLXArray, state: MLXArray) {
+    let result = gatedDeltaFeatureDecayKernel(
+        q: q,
+        k: k,
+        v: v,
+        decay: decay,
+        beta: beta,
+        state: state,
+        mask: mask
+    )
+    return (output: result.0, state: result.1)
+}
+
 // MARK: - Kernel Dispatch
 
 func gatedDeltaKernel(
