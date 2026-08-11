@@ -240,3 +240,496 @@ public struct BailingMoeV3Configuration: Codable, Sendable {
 }
 
 extension BailingMoeV3Configuration: ModelConfigurationValidating {}
+
+private func bailingMoeV3L2Normalize(_ x: MLXArray) -> MLXArray {
+    let x = x.asType(.float32)
+    let meanSquares = (x * x).sum(axis: -1, keepDims: true)
+    return x * (meanSquares + 1e-6).rsqrt()
+}
+
+private func bailingMoeV3InterleavedToHalf(_ x: MLXArray) -> MLXArray {
+    let dimension = x.dim(-1)
+    precondition(dimension.isMultiple(of: 2), "Rotary dimensions must be even")
+
+    let shape = x.shape
+    let paired = x.reshaped(Array(shape.dropLast()) + [dimension / 2, 2])
+    let axes = Array(0 ..< paired.ndim - 2) + [paired.ndim - 1, paired.ndim - 2]
+    return paired.transposed(axes: axes).reshaped(shape)
+}
+
+private class BailingMoeV3DenseMLP: Module, UnaryLayer {
+    @ModuleInfo(key: "gate_proj") var gateProj: Linear
+    @ModuleInfo(key: "up_proj") var upProj: Linear
+    @ModuleInfo(key: "down_proj") var downProj: Linear
+
+    init(_ configuration: BailingMoeV3Configuration, intermediateSize: Int? = nil) {
+        let intermediateSize = intermediateSize ?? configuration.intermediateSize
+        _gateProj.wrappedValue = Linear(configuration.hiddenSize, intermediateSize, bias: false)
+        _upProj.wrappedValue = Linear(configuration.hiddenSize, intermediateSize, bias: false)
+        _downProj.wrappedValue = Linear(intermediateSize, configuration.hiddenSize, bias: false)
+    }
+
+    func callAsFunction(_ x: MLXArray) -> MLXArray {
+        downProj(MLXNN.silu(gateProj(x)) * upProj(x))
+    }
+}
+
+private class BailingMoeV3Gate: Module {
+    let configuration: BailingMoeV3Configuration
+
+    // The outer sparse-MoE module owns `mlp.gate`; the projection itself is
+    // nested below it and receives the converted Hugging Face weight name.
+    @ModuleInfo(key: "gate_proj") var gateProj: Linear
+    @ParameterInfo(key: "expert_bias") var expertBias: MLXArray
+
+    init(_ configuration: BailingMoeV3Configuration) {
+        self.configuration = configuration
+        _gateProj.wrappedValue = Linear(
+            configuration.hiddenSize, configuration.numExperts, bias: false)
+        _expertBias.wrappedValue = MLXArray.zeros([configuration.numExperts])
+    }
+
+    func select(_ x: MLXArray) -> (indices: MLXArray, weights: MLXArray) {
+        let expertsPerGroup = configuration.numExperts / configuration.nGroup
+        let logits = gateProj(x)
+        let scores = MLXNN.sigmoid(logits.asType(.float32))
+        let routingScores = configuration.moeRouterEnableExpertBias
+            ? scores + expertBias.asType(.float32)
+            : scores
+        let grouped = routingScores.reshaped(
+            x.dim(0), x.dim(1), configuration.nGroup, expertsPerGroup)
+
+        let groupTop2 = argPartition(-grouped, kth: 1, axis: -1)[.ellipsis, ..<2]
+        let groupScores = takeAlong(grouped, groupTop2, axis: -1).sum(axis: -1)
+        let groupIndices = argPartition(
+            -groupScores, kth: configuration.topkGroup - 1, axis: -1
+        )[
+            .ellipsis, ..<configuration.topkGroup
+        ]
+
+        let groupGather = repeated(
+            expandedDimensions(groupIndices, axis: -1), count: expertsPerGroup, axis: -1)
+        let candidateScores = takeAlong(grouped, groupGather, axis: 2).flattened(
+            start: -2, end: -1)
+        let localIDs = MLXArray(0 ..< expertsPerGroup).reshaped(1, 1, 1, expertsPerGroup)
+        let globalIDs = (
+            groupGather * expertsPerGroup + localIDs
+        ).flattened(start: -2, end: -1)
+        let selectedCandidates = argPartition(
+            -candidateScores, kth: configuration.numExpertsPerToken - 1, axis: -1
+        )[
+            .ellipsis, ..<configuration.numExpertsPerToken
+        ]
+        let indices = takeAlong(globalIDs, selectedCandidates, axis: -1)
+        var weights = takeAlong(scores, indices, axis: -1)
+        if configuration.normTopkProb, configuration.numExpertsPerToken > 1 {
+            weights = weights / (weights.sum(axis: -1, keepDims: true) + 1e-20)
+        }
+        return (indices, weights * configuration.routedScalingFactor)
+    }
+}
+
+private class BailingMoeV3SparseMoeBlock: Module, UnaryLayer {
+    let configuration: BailingMoeV3Configuration
+
+    @ModuleInfo(key: "switch_mlp") var switchMLP: SwitchGLU
+    @ModuleInfo(key: "gate") var gate: BailingMoeV3Gate
+    @ModuleInfo(key: "shared_experts") var sharedExperts: BailingMoeV3DenseMLP?
+
+    init(_ configuration: BailingMoeV3Configuration) {
+        self.configuration = configuration
+        _switchMLP.wrappedValue = SwitchGLU(
+            inputDims: configuration.hiddenSize,
+            hiddenDims: configuration.moeIntermediateSize,
+            numExperts: configuration.numExperts,
+            bias: false
+        )
+        _gate.wrappedValue = BailingMoeV3Gate(configuration)
+        if configuration.numSharedExperts > 0 {
+            _sharedExperts.wrappedValue = BailingMoeV3DenseMLP(
+                configuration,
+                intermediateSize: configuration.moeSharedExpertIntermediateSize
+                    * configuration.numSharedExperts
+            )
+        } else {
+            _sharedExperts.wrappedValue = nil
+        }
+    }
+
+    func callAsFunction(_ x: MLXArray) -> MLXArray {
+        let (indices, weights) = gate.select(x)
+        var output = weightedExpertSum(switchMLP(x, indices), weights)
+        if let sharedExperts {
+            output = output + sharedExperts(x)
+        }
+        return output
+    }
+}
+
+private protocol BailingMoeV3Attention: Module {
+    func callAsFunction(
+        _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
+    ) -> MLXArray
+}
+
+private class BailingMoeV3KDAAttention: Module, BailingMoeV3Attention {
+    let configuration: BailingMoeV3Configuration
+
+    @ModuleInfo(key: "q_proj") var qProj: Linear
+    @ModuleInfo(key: "k_proj") var kProj: Linear
+    @ModuleInfo(key: "v_proj") var vProj: Linear
+    @ModuleInfo(key: "f_proj") var fProj: Linear
+    @ModuleInfo(key: "b_proj") var bProj: Linear
+    @ModuleInfo(key: "g_proj") var gProj: Linear
+    @ModuleInfo(key: "o_proj") var oProj: Linear
+    @ModuleInfo(key: "q_conv1d") var qConv: Conv1d
+    @ModuleInfo(key: "k_conv1d") var kConv: Conv1d
+    @ModuleInfo(key: "v_conv1d") var vConv: Conv1d
+    @ModuleInfo(key: "o_norm") var oNorm: RMSNorm
+    @ParameterInfo(key: "A_log") var aLog: MLXArray
+    @ParameterInfo(key: "dt_bias") var dtBias: MLXArray
+
+    init(_ configuration: BailingMoeV3Configuration) {
+        self.configuration = configuration
+        let projectionSize = configuration.projectionSize
+        _qProj.wrappedValue = Linear(configuration.hiddenSize, projectionSize, bias: false)
+        _kProj.wrappedValue = Linear(configuration.hiddenSize, projectionSize, bias: false)
+        _vProj.wrappedValue = Linear(configuration.hiddenSize, projectionSize, bias: false)
+        _fProj.wrappedValue = Linear(configuration.hiddenSize, projectionSize, bias: false)
+        _bProj.wrappedValue = Linear(configuration.hiddenSize, configuration.numAttentionHeads, bias: false)
+        _gProj.wrappedValue = Linear(configuration.hiddenSize, projectionSize, bias: false)
+        _oProj.wrappedValue = Linear(projectionSize, configuration.hiddenSize, bias: false)
+        _qConv.wrappedValue = Conv1d(
+            inputChannels: projectionSize, outputChannels: projectionSize,
+            kernelSize: configuration.shortConvKernelSize, groups: projectionSize, bias: false)
+        _kConv.wrappedValue = Conv1d(
+            inputChannels: projectionSize, outputChannels: projectionSize,
+            kernelSize: configuration.shortConvKernelSize, groups: projectionSize, bias: false)
+        _vConv.wrappedValue = Conv1d(
+            inputChannels: projectionSize, outputChannels: projectionSize,
+            kernelSize: configuration.shortConvKernelSize, groups: projectionSize, bias: false)
+        _oNorm.wrappedValue = RMSNorm(dimensions: configuration.headDim, eps: configuration.rmsNormEps)
+        _aLog.wrappedValue = MLXArray.zeros([configuration.numAttentionHeads])
+        _dtBias.wrappedValue = MLXArray.zeros([projectionSize])
+    }
+
+    func callAsFunction(
+        _ x: MLXArray, mask _: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
+    ) -> MLXArray {
+        let cache = cache as? MambaCache
+        let (batch, length) = (x.dim(0), x.dim(1))
+        let projectionSize = configuration.projectionSize
+        let kernelTail = configuration.shortConvKernelSize - 1
+        let projected = concatenated([qProj(x), kProj(x), vProj(x)], axis: -1)
+        let convState = cache?[0] ?? MLXArray.zeros(
+            [batch, kernelTail, 3 * projectionSize], dtype: x.dtype)
+        let paddedInput = concatenated([convState, projected], axis: 1)
+        let projectedParts = split(paddedInput, indices: [projectionSize, 2 * projectionSize], axis: -1)
+        let q = MLXNN.silu(qConv(projectedParts[0])).reshaped(
+            batch, length, configuration.numAttentionHeads, configuration.headDim)
+        let k = MLXNN.silu(kConv(projectedParts[1])).reshaped(
+            batch, length, configuration.numAttentionHeads, configuration.headDim)
+        let v = MLXNN.silu(vConv(projectedParts[2])).reshaped(
+            batch, length, configuration.numAttentionHeads, configuration.headDim)
+
+        let normalizedQ = bailingMoeV3L2Normalize(q)
+            * Float(1.0 / sqrt(Double(configuration.headDim)))
+        let normalizedK = bailingMoeV3L2Normalize(k)
+        let values = v.asType(.float32)
+        let decayInput = fProj(x).reshaped(
+            batch, length, configuration.numAttentionHeads, configuration.headDim).asType(.float32)
+        let beta = MLXNN.sigmoid(
+            bProj(x).reshaped(batch, length, configuration.numAttentionHeads).asType(.float32))
+        let aExp = exp(aLog.asType(.float32)).reshaped(1, 1, configuration.numAttentionHeads, 1)
+        let dt = dtBias.asType(.float32).reshaped(
+            1, 1, configuration.numAttentionHeads, configuration.headDim)
+        let logDecay: MLXArray
+        if configuration.kdaSafeGate {
+            logDecay = MLXNN.sigmoid(aExp * (decayInput + dt)) * configuration.kdaLowerBound
+        } else {
+            logDecay = -(aExp * MLXNN.softplus(decayInput + dt))
+        }
+        let decay = exp(logDecay)
+
+        var state = cache?[1] ?? MLXArray.zeros(
+            [batch, configuration.numAttentionHeads, configuration.headDim, configuration.headDim],
+            dtype: .float32
+        )
+        var outputs: [MLXArray] = []
+        outputs.reserveCapacity(length)
+        for token in 0 ..< length {
+            let qToken = normalizedQ[0..., token, 0..., 0...]
+            let kToken = normalizedK[0..., token, 0..., 0...]
+            let vToken = values[0..., token, 0..., 0...]
+            let decayToken = decay[0..., token, 0..., 0...]
+            let betaToken = beta[0..., token, 0...]
+            let keyExpanded = expandedDimensions(kToken, axis: -2)
+            state = state * expandedDimensions(decayToken, axis: -1)
+            let memory = (state * keyExpanded).sum(axis: -1)
+            let delta = (vToken - memory) * expandedDimensions(betaToken, axis: -1)
+            state = state + keyExpanded * expandedDimensions(delta, axis: -1)
+            let output = (state * expandedDimensions(qToken, axis: -2)).sum(axis: -1)
+            outputs.append(expandedDimensions(output.asType(x.dtype), axis: 1))
+        }
+
+        if let cache {
+            let start = max(0, paddedInput.dim(1) - kernelTail)
+            cache[0] = contiguous(paddedInput[0..., start..., 0...])
+            cache[1] = state
+            cache.advance(length)
+        }
+
+        var output = concatenated(outputs, axis: 1)
+        output = oNorm(output)
+        let gate = MLXNN.sigmoid(gProj(x).reshaped(
+            batch, length, configuration.numAttentionHeads, configuration.headDim).asType(.float32))
+        output = (output.asType(.float32) * gate).asType(x.dtype)
+        return oProj(output.reshaped(batch, length, projectionSize))
+    }
+}
+
+private class BailingMoeV3MLAAttention: Module, BailingMoeV3Attention {
+    let configuration: BailingMoeV3Configuration
+    let scale: Float
+    let rope: RoPELayer
+
+    @ModuleInfo(key: "q_proj") var qProj: Linear?
+    @ModuleInfo(key: "q_a_proj") var qAProj: Linear?
+    @ModuleInfo(key: "q_a_layernorm") var qALayerNorm: RMSNorm?
+    @ModuleInfo(key: "q_b_proj") var qBProj: Linear?
+    @ModuleInfo(key: "kv_a_proj_with_mqa") var kvAProjWithMqa: Linear
+    @ModuleInfo(key: "kv_a_layernorm") var kvALayerNorm: RMSNorm
+    @ModuleInfo(key: "kv_b_proj") var kvBProj: Linear
+    @ModuleInfo(key: "g_proj") var gProj: Linear
+    @ModuleInfo(key: "dense") var dense: Linear
+
+    init(_ configuration: BailingMoeV3Configuration) {
+        self.configuration = configuration
+        self.scale = pow(Float(configuration.qkHeadDim), -0.5)
+        self.rope = initializeRope(
+            dims: configuration.qkRopeHeadDim, base: configuration.ropeTheta,
+            traditional: false, scalingConfig: nil,
+            maxPositionEmbeddings: configuration.maxPositionEmbeddings)
+
+        if configuration.qLoraRank > 0 {
+            _qProj.wrappedValue = nil
+            _qAProj.wrappedValue = Linear(configuration.hiddenSize, configuration.qLoraRank, bias: false)
+            _qALayerNorm.wrappedValue = RMSNorm(
+                dimensions: configuration.qLoraRank, eps: configuration.rmsNormEps)
+            _qBProj.wrappedValue = Linear(
+                configuration.qLoraRank,
+                configuration.numAttentionHeads * configuration.qkHeadDim,
+                bias: false
+            )
+        } else {
+            _qProj.wrappedValue = Linear(
+                configuration.hiddenSize,
+                configuration.numAttentionHeads * configuration.qkHeadDim,
+                bias: false
+            )
+            _qAProj.wrappedValue = nil
+            _qALayerNorm.wrappedValue = nil
+            _qBProj.wrappedValue = nil
+        }
+        _kvAProjWithMqa.wrappedValue = Linear(
+            configuration.hiddenSize, configuration.kvLoraRank + configuration.qkRopeHeadDim,
+            bias: false)
+        _kvALayerNorm.wrappedValue = RMSNorm(
+            dimensions: configuration.kvLoraRank, eps: configuration.rmsNormEps)
+        _kvBProj.wrappedValue = Linear(
+            configuration.kvLoraRank,
+            configuration.numAttentionHeads * (configuration.qkNopeHeadDim + configuration.vHeadDim),
+            bias: false)
+        _gProj.wrappedValue = Linear(
+            configuration.hiddenSize, configuration.numAttentionHeads, bias: false)
+        _dense.wrappedValue = Linear(
+            configuration.numAttentionHeads * configuration.vHeadDim, configuration.hiddenSize,
+            bias: false)
+    }
+
+    func callAsFunction(
+        _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
+    ) -> MLXArray {
+        let (batch, length) = (x.dim(0), x.dim(1))
+        let q: MLXArray
+        if let qProj {
+            q = qProj(x)
+        } else {
+            q = qBProj!(qALayerNorm!(qAProj!(x)))
+        }
+        let qParts = split(
+            q.reshaped(batch, length, configuration.numAttentionHeads, configuration.qkHeadDim)
+                .transposed(0, 2, 1, 3),
+            indices: [configuration.qkNopeHeadDim], axis: -1)
+        let qNope = qParts[0]
+        var qPE = qParts[1]
+
+        let compressed = kvAProjWithMqa(x)
+        let compressedParts = split(compressed, indices: [configuration.kvLoraRank], axis: -1)
+        let kvLatent = compressedParts[0]
+        var kPE = compressedParts[1].reshaped(
+            batch, length, 1, configuration.qkRopeHeadDim).transposed(0, 2, 1, 3)
+        let kvExpanded = kvBProj(kvALayerNorm(kvLatent)).reshaped(
+            batch, length, configuration.numAttentionHeads,
+            configuration.qkNopeHeadDim + configuration.vHeadDim
+        ).transposed(0, 2, 1, 3)
+        let kvParts = split(kvExpanded, indices: [configuration.qkNopeHeadDim], axis: -1)
+        let kNope = kvParts[0]
+        let values = kvParts[1]
+
+        let offset = cache?.ropeOffset
+        qPE = applyRotaryPosition(rope, to: bailingMoeV3InterleavedToHalf(qPE), offset: offset)
+        kPE = applyRotaryPosition(rope, to: bailingMoeV3InterleavedToHalf(kPE), offset: offset)
+        kPE = repeated(kPE, count: configuration.numAttentionHeads, axis: 1)
+
+        let queries = concatenated([qNope, qPE], axis: -1)
+        let keys = concatenated([kNope, kPE], axis: -1)
+        var output = attentionWithCacheUpdate(
+            queries: queries, keys: keys, values: values, cache: cache, scale: scale, mask: mask)
+        let gate = MLXNN.sigmoid(gProj(x).asType(.float32)).transposed(0, 2, 1)
+            .expandedDimensions(axis: -1)
+        output = (output.asType(.float32) * gate).asType(x.dtype)
+        return dense(output.transposed(0, 2, 1, 3).reshaped(batch, length, -1))
+    }
+}
+
+private class BailingMoeV3TransformerBlock: Module {
+    @ModuleInfo(key: "attention") var attention: Module & BailingMoeV3Attention
+    @ModuleInfo(key: "mlp") var mlp: Module & UnaryLayer
+    @ModuleInfo(key: "input_layernorm") var inputLayerNorm: RMSNorm
+    @ModuleInfo(key: "post_attention_layernorm") var postAttentionLayerNorm: RMSNorm
+
+    init(_ configuration: BailingMoeV3Configuration, layerIndex: Int) {
+        if configuration.attentionKind(forLayer: layerIndex) == .kda {
+            _attention.wrappedValue = BailingMoeV3KDAAttention(configuration)
+        } else {
+            _attention.wrappedValue = BailingMoeV3MLAAttention(configuration)
+        }
+        _inputLayerNorm.wrappedValue = RMSNorm(
+            dimensions: configuration.hiddenSize, eps: configuration.rmsNormEps)
+        _postAttentionLayerNorm.wrappedValue = RMSNorm(
+            dimensions: configuration.hiddenSize, eps: configuration.rmsNormEps)
+        if layerIndex < configuration.firstKDenseReplace {
+            _mlp.wrappedValue = BailingMoeV3DenseMLP(configuration)
+        } else {
+            _mlp.wrappedValue = BailingMoeV3SparseMoeBlock(configuration)
+        }
+    }
+
+    func callAsFunction(
+        _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
+    ) -> MLXArray {
+        let hidden = x + attention(inputLayerNorm(x), mask: mask, cache: cache)
+        return hidden + mlp(postAttentionLayerNorm(hidden))
+    }
+}
+
+private class BailingMoeV3ModelInner: Module {
+    let configuration: BailingMoeV3Configuration
+    let firstMLALayerIndex: Int
+
+    @ModuleInfo(key: "word_embeddings") var embedTokens: Embedding
+    fileprivate let layers: [BailingMoeV3TransformerBlock]
+    let norm: RMSNorm
+
+    init(_ configuration: BailingMoeV3Configuration) {
+        self.configuration = configuration
+        self.firstMLALayerIndex = (0 ..< configuration.numHiddenLayers).first {
+            configuration.attentionKind(forLayer: $0) == .mla
+        } ?? 0
+        _embedTokens.wrappedValue = Embedding(
+            embeddingCount: configuration.vocabularySize, dimensions: configuration.hiddenSize)
+        self.layers = (0 ..< configuration.numHiddenLayers).map {
+            BailingMoeV3TransformerBlock(configuration, layerIndex: $0)
+        }
+        self.norm = RMSNorm(dimensions: configuration.hiddenSize, eps: configuration.rmsNormEps)
+    }
+
+    func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+        var hidden = embedTokens(inputs)
+        let mask = createAttentionMask(h: hidden, cache: cache?[firstMLALayerIndex])
+        for (index, layer) in layers.enumerated() {
+            hidden = layer(hidden, mask: mask, cache: cache?[index])
+        }
+        return norm(hidden)
+    }
+}
+
+public class BailingMoeV3Model: Module, LLMModel, KVCacheDimensionProvider {
+    public let vocabularySize: Int
+    public let kvHeads: [Int]
+    let configuration: BailingMoeV3Configuration
+
+    @ModuleInfo(key: "model") fileprivate var model: BailingMoeV3ModelInner
+    @ModuleInfo(key: "lm_head") var lmHead: Linear?
+
+    public init(_ configuration: BailingMoeV3Configuration) {
+        self.configuration = configuration
+        self.vocabularySize = configuration.vocabularySize
+        self.kvHeads = Array(repeating: configuration.numAttentionHeads, count: configuration.numHiddenLayers)
+        _model.wrappedValue = BailingMoeV3ModelInner(configuration)
+        if !configuration.tieWordEmbeddings {
+            _lmHead.wrappedValue = Linear(configuration.hiddenSize, configuration.vocabularySize, bias: false)
+        }
+    }
+
+    public func newCache(parameters: GenerateParameters?) -> [KVCache] {
+        (0 ..< configuration.numHiddenLayers).map { layer in
+            configuration.attentionKind(forLayer: layer) == .kda ? MambaCache() : KVCacheSimple()
+        }
+    }
+
+    public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+        let output = model(inputs, cache: cache)
+        if let lmHead {
+            return lmHead(output)
+        }
+        return model.embedTokens.asLinear(output)
+    }
+
+    public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
+        var sanitized = weights
+        if configuration.tieWordEmbeddings {
+            sanitized["lm_head.weight"] = nil
+        }
+
+        for layer in 0 ..< configuration.numHiddenLayers {
+            let prefix = "model.layers.\(layer)"
+
+            if configuration.attentionKind(forLayer: layer) == .mla,
+                let gateWeight = sanitized.removeValue(forKey: "\(prefix).mlp.gate.weight")
+            {
+                sanitized["\(prefix).mlp.gate.gate_proj.weight"] = gateWeight
+            }
+
+            if configuration.attentionKind(forLayer: layer) == .kda {
+                for projection in ["q_conv1d", "k_conv1d", "v_conv1d"] {
+                    let key = "\(prefix).attention.\(projection).weight"
+                    if let weight = sanitized[key], weight.ndim == 3, weight.dim(1) == 1 {
+                        sanitized[key] = weight.movedAxis(source: 2, destination: 1)
+                    }
+                }
+            }
+
+            guard layer >= configuration.firstKDenseReplace else { continue }
+            for projection in ["gate_proj", "up_proj", "down_proj"] {
+                let firstKey = "\(prefix).mlp.experts.0.\(projection).weight"
+                guard sanitized[firstKey] != nil else { continue }
+                let keys = (0 ..< configuration.numExperts).map {
+                    "\(prefix).mlp.experts.\($0).\(projection).weight"
+                }
+                let expertWeights = keys.compactMap { sanitized[$0] }
+                guard expertWeights.count == configuration.numExperts else { continue }
+                sanitized["\(prefix).mlp.switch_mlp.\(projection).weight"] = stacked(expertWeights)
+                for key in keys {
+                    sanitized[key] = nil
+                }
+            }
+        }
+        return sanitized
+    }
+}
+
+extension BailingMoeV3Model: LoRAModel {
+    public var loraLayers: [Module] { model.layers }
+}

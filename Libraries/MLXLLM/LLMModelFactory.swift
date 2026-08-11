@@ -74,6 +74,7 @@ public enum LLMTypeRegistry {
         "olmo2": create(Olmo2Configuration.self, Olmo2Model.init),
         "olmo3": create(Olmo3Configuration.self, Olmo3Model.init),
         "bailing_moe": create(BailingMoeConfiguration.self, BailingMoeModel.init),
+        "bailing_hybrid": create(BailingMoeV3Configuration.self, BailingMoeV3Model.init),
         "lfm2_moe": create(LFM2MoEConfiguration.self, LFM2MoEModel.init),
         "nanochat": create(NanoChatConfiguration.self, NanoChatModel.init),
         "nemotron_h": create(NemotronHConfiguration.self, NemotronHModel.init),

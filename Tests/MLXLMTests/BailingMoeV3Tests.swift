@@ -94,6 +94,11 @@ struct BailingMoeV3Tests {
         }
     }
 
+    @Test("registers bailing_hybrid with the LLM factory")
+    func registersBailingHybridModelType() async {
+        #expect(await LLMTypeRegistry.shared.contains("bailing_hybrid"))
+    }
+
     @Test("creates recurrent and attention caches for the hybrid layer schedule")
     func createsHybridCaches() throws {
         let configuration = try BailingMoeV3Configuration(
