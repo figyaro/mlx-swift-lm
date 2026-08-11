@@ -294,6 +294,18 @@ private func makeBailingMoeV3KDADecodeStep(
 private let bailingMoeV3KDADecodeStepSafe = makeBailingMoeV3KDADecodeStep(safeGate: true)
 private let bailingMoeV3KDADecodeStepSoftplus = makeBailingMoeV3KDADecodeStep(safeGate: false)
 
+/// Compile the head-wise output gate used after the recurrent KDA state.
+///
+/// This is deliberately kept separate from the recurrence graph: the output
+/// gate consumes the normalized state and is also used by the prefill path.
+/// Keeping it as a tiny compiled graph removes the per-token sigmoid,
+/// broadcast, multiply, and cast launch sequence without changing the FP32
+/// accumulation semantics of the recurrent state.
+private let bailingMoeV3KDAOutputGate: @Sendable (MLXArray, MLXArray) -> MLXArray =
+    compile(shapeless: true) { output, gate in
+        (output.asType(.float32) * MLXNN.sigmoid(gate.asType(.float32))).asType(output.dtype)
+    }
+
 private func bailingMoeV3InterleavedToHalf(_ x: MLXArray) -> MLXArray {
     let dimension = x.dim(-1)
     precondition(dimension.isMultiple(of: 2), "Rotary dimensions must be even")
@@ -405,68 +417,8 @@ private class BailingMoeV3DenseMLP: Module, UnaryLayer {
     }
 }
 
-private func bailingMoeV3RouteTopK(
-    scores: MLXArray,
-    routingScores: MLXArray,
-    configuration: BailingMoeV3Configuration
-) -> (indices: MLXArray, weights: MLXArray) {
-    let expertsPerGroup = configuration.numExperts / configuration.nGroup
-    let grouped = routingScores.reshaped(
-        1, 1, configuration.nGroup, expertsPerGroup)
-
-    let groupTop2 = argPartition(-grouped, kth: 1, axis: -1)[.ellipsis, ..<2]
-    let groupScores = takeAlong(grouped, groupTop2, axis: -1).sum(axis: -1)
-    let groupIndices = argPartition(
-        -groupScores, kth: configuration.topkGroup - 1, axis: -1
-    )[
-        .ellipsis, ..<configuration.topkGroup
-    ]
-
-    let groupGather = repeated(
-        expandedDimensions(groupIndices, axis: -1), count: expertsPerGroup, axis: -1)
-    let candidateScores = takeAlong(grouped, groupGather, axis: 2).flattened(
-        start: -2, end: -1)
-    let localIDs = MLXArray(0 ..< expertsPerGroup).reshaped(1, 1, 1, expertsPerGroup)
-    let globalIDs = (
-        groupGather * expertsPerGroup + localIDs
-    ).flattened(start: -2, end: -1)
-    let selectedCandidates = argPartition(
-        -candidateScores, kth: configuration.numExpertsPerToken - 1, axis: -1
-    )[
-        .ellipsis, ..<configuration.numExpertsPerToken
-    ]
-    let indices = takeAlong(globalIDs, selectedCandidates, axis: -1)
-    var weights = takeAlong(scores, indices, axis: -1)
-    if configuration.normTopkProb, configuration.numExpertsPerToken > 1 {
-        weights = weights / (weights.sum(axis: -1, keepDims: true) + 1e-20)
-    }
-    return (indices, weights * configuration.routedScalingFactor)
-}
-
-private func makeBailingMoeV3DecodeRouter(
-    _ configuration: BailingMoeV3Configuration
-) -> @Sendable ([MLXArray]) -> [MLXArray] {
-    compile(shapeless: true) { inputs in
-        let scores = MLXNN.sigmoid(inputs[0].asType(.float32))
-        let routingScores: MLXArray
-        if configuration.moeRouterEnableExpertBias {
-            routingScores = scores + inputs[1].asType(.float32).reshaped(
-                1, 1, configuration.numExperts)
-        } else {
-            routingScores = scores
-        }
-        let route = bailingMoeV3RouteTopK(
-            scores: scores,
-            routingScores: routingScores,
-            configuration: configuration
-        )
-        return [route.indices, route.weights]
-    }
-}
-
 private class BailingMoeV3Gate: Module {
     let configuration: BailingMoeV3Configuration
-    private let fusedDecodeRouter: @Sendable ([MLXArray]) -> [MLXArray]
 
     // The outer sparse-MoE module owns `mlp.gate`; the projection itself is
     // nested below it and receives the converted Hugging Face weight name.
@@ -475,26 +427,18 @@ private class BailingMoeV3Gate: Module {
 
     init(_ configuration: BailingMoeV3Configuration) {
         self.configuration = configuration
-        self.fusedDecodeRouter = makeBailingMoeV3DecodeRouter(configuration)
         _gateProj.wrappedValue = Linear(
             configuration.hiddenSize, configuration.numExperts, bias: false)
         _expertBias.wrappedValue = MLXArray.zeros([configuration.numExperts])
     }
 
     func select(_ x: MLXArray) -> (indices: MLXArray, weights: MLXArray) {
-        // Router logits remain a regular matmul.  For B=L=1, compile the
-        // grouped top-k data-movement graph once and reuse it on every decode
-        // step.  This removes the repeated host graph construction and fuses
-        // the small sigmoid/reshape/take/normalization sequence.
+        // The router projection remains a regular matmul.  The grouped top-k
+        // sequence below deliberately remains eager: MLX 0.29 cannot infer
+        // the output shape of `argPartition(...)[..., ..<k]` inside a compiled
+        // graph.  Compile the fixed-shape KDA recurrence instead; it is the
+        // dominant per-token launch cost and does not depend on this limitation.
         let logits = gateProj(x)
-        if x.dim(0) == 1, x.dim(1) == 1,
-            configuration.headDim.isMultiple(of: 32) {
-            let inputs = configuration.moeRouterEnableExpertBias
-                ? [logits, expertBias]
-                : [logits]
-            let outputs = fusedDecodeRouter(inputs)
-            return (indices: outputs[0], weights: outputs[1])
-        }
 
         let expertsPerGroup = configuration.numExperts / configuration.nGroup
         let scores = MLXNN.sigmoid(logits.asType(.float32))
@@ -735,9 +679,18 @@ private class BailingMoeV3KDAAttention: Module, BailingMoeV3Attention {
 
         var output = recurrence.output
         output = oNorm(output)
-        let gate = MLXNN.sigmoid(fbgParts[2].reshaped(
-            batch, length, configuration.numAttentionHeads, configuration.headDim).asType(.float32))
-        output = (output.asType(.float32) * gate).asType(x.dtype)
+        if length == 1, configuration.headDim.isMultiple(of: 32) {
+            output = bailingMoeV3KDAOutputGate(
+                output,
+                fbgParts[2].reshaped(
+                    batch, length, configuration.numAttentionHeads, configuration.headDim
+                )
+            )
+        } else {
+            let gate = MLXNN.sigmoid(fbgParts[2].reshaped(
+                batch, length, configuration.numAttentionHeads, configuration.headDim).asType(.float32))
+            output = (output.asType(.float32) * gate).asType(x.dtype)
+        }
         return oProj(output.reshaped(batch, length, projectionSize))
     }
 }
