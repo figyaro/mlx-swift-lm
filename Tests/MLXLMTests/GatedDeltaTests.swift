@@ -3,6 +3,7 @@
 import Foundation
 import MLX
 import MLXLMCommon
+import MLXNN
 import XCTest
 
 public class GatedDeltaTests: XCTestCase {
@@ -76,6 +77,40 @@ public class GatedDeltaTests: XCTestCase {
             "Multi-chunk GDN prefill diverged from single-chunk by \(maxDiff) max abs. "
                 + "Cross-chunk state must persist in fp32; bf16 cast loses precision."
         )
+    }
+
+    /// Ling KDA uses a separate decay for each key feature, unlike the scalar
+    /// head-wise decay used by Qwen's gated-delta layers. Its Metal path must
+    /// preserve the recurrent fp32 state across prompt chunks as well.
+    func testFeatureDecayGatedDeltaMultiChunkMatchesSingleChunk() throws {
+        let T = 16
+        let inputs = makeInputs(T: T, Hk: 2, Dk: 32, Hv: 2, Dv: 32)
+        let decay = MLXNN.sigmoid(
+            MLXRandom.normal([1, T, 2, 32]).asType(.float32)
+        )
+        let beta = MLXNN.sigmoid(inputs.b.asType(.float32))
+
+        let (ySingle, _) = gatedDeltaFeatureDecayUpdate(
+            q: inputs.q, k: inputs.k, v: inputs.v,
+            decay: decay, beta: beta
+        )
+        eval(ySingle)
+
+        let mid = T / 2
+        let (y1, state1) = gatedDeltaFeatureDecayUpdate(
+            q: inputs.q[0..., ..<mid], k: inputs.k[0..., ..<mid], v: inputs.v[0..., ..<mid],
+            decay: decay[0..., ..<mid], beta: beta[0..., ..<mid]
+        )
+        let (y2, _) = gatedDeltaFeatureDecayUpdate(
+            q: inputs.q[0..., mid...], k: inputs.k[0..., mid...], v: inputs.v[0..., mid...],
+            decay: decay[0..., mid...], beta: beta[0..., mid...], state: state1
+        )
+        let yMulti = concatenated([y1, y2], axis: 1)
+        eval(yMulti)
+
+        let diff = abs(ySingle.asType(.float32) - yMulti.asType(.float32)).max()
+        eval(diff)
+        XCTAssertLessThan(diff.item(Float.self), 1e-2)
     }
 
 }

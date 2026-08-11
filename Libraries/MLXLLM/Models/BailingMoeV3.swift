@@ -435,7 +435,6 @@ private class BailingMoeV3KDAAttention: Module, BailingMoeV3Attention {
         let normalizedQ = bailingMoeV3L2Normalize(q)
             * Float(1.0 / sqrt(Double(configuration.headDim)))
         let normalizedK = bailingMoeV3L2Normalize(k)
-        let values = v.asType(.float32)
         let decayInput = fProj(x).reshaped(
             batch, length, configuration.numAttentionHeads, configuration.headDim).asType(.float32)
         let beta = MLXNN.sigmoid(
@@ -451,26 +450,14 @@ private class BailingMoeV3KDAAttention: Module, BailingMoeV3Attention {
         }
         let decay = exp(logDecay)
 
-        var state = cache?[1] ?? MLXArray.zeros(
-            [batch, configuration.numAttentionHeads, configuration.headDim, configuration.headDim],
-            dtype: .float32
+        let (recurrentOutput, state) = gatedDeltaFeatureDecayUpdate(
+            q: normalizedQ,
+            k: normalizedK,
+            v: v,
+            decay: decay,
+            beta: beta,
+            state: cache?[1]
         )
-        var outputs: [MLXArray] = []
-        outputs.reserveCapacity(length)
-        for token in 0 ..< length {
-            let qToken = normalizedQ[0..., token, 0..., 0...]
-            let kToken = normalizedK[0..., token, 0..., 0...]
-            let vToken = values[0..., token, 0..., 0...]
-            let decayToken = decay[0..., token, 0..., 0...]
-            let betaToken = beta[0..., token, 0...]
-            let keyExpanded = expandedDimensions(kToken, axis: -2)
-            state = state * expandedDimensions(decayToken, axis: -1)
-            let memory = (state * keyExpanded).sum(axis: -1)
-            let delta = (vToken - memory) * expandedDimensions(betaToken, axis: -1)
-            state = state + keyExpanded * expandedDimensions(delta, axis: -1)
-            let output = (state * expandedDimensions(qToken, axis: -2)).sum(axis: -1)
-            outputs.append(expandedDimensions(output.asType(x.dtype), axis: 1))
-        }
 
         if let cache {
             let start = max(0, paddedInput.dim(1) - kernelTail)
@@ -479,7 +466,7 @@ private class BailingMoeV3KDAAttention: Module, BailingMoeV3Attention {
             cache.advance(length)
         }
 
-        var output = concatenated(outputs, axis: 1)
+        var output = recurrentOutput
         output = oNorm(output)
         let gate = MLXNN.sigmoid(gProj(x).reshaped(
             batch, length, configuration.numAttentionHeads, configuration.headDim).asType(.float32))
