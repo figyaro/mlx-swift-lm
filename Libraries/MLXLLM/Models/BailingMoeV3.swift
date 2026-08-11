@@ -247,6 +247,69 @@ private func bailingMoeV3L2Normalize(_ x: MLXArray) -> MLXArray {
     return x * (meanSquares + 1e-6).rsqrt()
 }
 
+/// Decode-only compression for the wide dense projections around the routed
+/// experts. Ollama's latest Bailing path quantizes float passthrough tensors
+/// on request because lm_head and attention projections otherwise dominate
+/// single-token memory traffic. Keep the checkpoint and prefill path in its
+/// native dtype; only B=L=1 calls use the cached MXFP8 representation.
+private enum BailingMoeV3DecodeQuantization {
+    static let groupSize = 32
+    static let bits = 8
+    static let mode: QuantizationMode = .mxfp8
+    static let enabled = ProcessInfo.processInfo.environment["DENOJU_LING_DENSE_MXFP8"] != "0"
+
+    static func supports(_ weight: MLXArray) -> Bool {
+        guard enabled, weight.ndim == 2,
+            weight.dim(-1).isMultiple(of: groupSize),
+            weight.dim(0) >= 512, weight.dim(-1) >= 512
+        else {
+            return false
+        }
+        return weight.dtype == .bfloat16 || weight.dtype == .float16 || weight.dtype == .float32
+    }
+}
+
+private final class BailingMoeV3DecodeLinear: Linear {
+    private var decodeQuantizedWeight:
+        (weight: MLXArray, scales: MLXArray, biases: MLXArray?)?
+    private let decodeQuantizedWeightLock = NSLock()
+
+    override func callAsFunction(_ x: MLXArray) -> MLXArray {
+        guard bias == nil, x.ndim >= 2, x.dim(0) == 1, x.dim(1) == 1,
+            BailingMoeV3DecodeQuantization.supports(weight)
+        else {
+            return super.callAsFunction(x)
+        }
+
+        decodeQuantizedWeightLock.lock()
+        if decodeQuantizedWeight == nil {
+            let quantized = MLX.quantized(
+                weight,
+                groupSize: BailingMoeV3DecodeQuantization.groupSize,
+                bits: BailingMoeV3DecodeQuantization.bits,
+                mode: BailingMoeV3DecodeQuantization.mode)
+            var arrays = [quantized.0, quantized.1]
+            if let biases = quantized.2 {
+                arrays.append(biases)
+            }
+            // Publish only evaluated immutable tensors. MLXArray lazy graphs
+            // must not be initialized concurrently by separate chat sessions.
+            eval(arrays)
+            decodeQuantizedWeight = (
+                weight: quantized.0, scales: quantized.1, biases: quantized.2)
+        }
+        let quantized = decodeQuantizedWeight!
+        decodeQuantizedWeightLock.unlock()
+
+        return MLX.quantizedMM(
+            x, quantized.weight, scales: quantized.scales, biases: quantized.biases,
+            transpose: true,
+            groupSize: BailingMoeV3DecodeQuantization.groupSize,
+            bits: BailingMoeV3DecodeQuantization.bits,
+            mode: BailingMoeV3DecodeQuantization.mode)
+    }
+}
+
 /// Build the single-token KDA graph used during autoregressive decode.
 ///
 /// Prefill still uses the dedicated SIMD recurrence kernel below.  Decode is a
@@ -406,9 +469,10 @@ private class BailingMoeV3DenseMLP: Module, UnaryLayer {
 
     init(_ configuration: BailingMoeV3Configuration, intermediateSize: Int? = nil) {
         let intermediateSize = intermediateSize ?? configuration.intermediateSize
-        _gateUpProj.wrappedValue = Linear(
+        _gateUpProj.wrappedValue = BailingMoeV3DecodeLinear(
             configuration.hiddenSize, 2 * intermediateSize, bias: false)
-        _downProj.wrappedValue = Linear(intermediateSize, configuration.hiddenSize, bias: false)
+        _downProj.wrappedValue = BailingMoeV3DecodeLinear(
+            intermediateSize, configuration.hiddenSize, bias: false)
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
@@ -502,7 +566,7 @@ private class BailingMoeV3Gate: Module {
     init(_ configuration: BailingMoeV3Configuration) {
         self.configuration = configuration
         self.fusedDecodeRouter = makeBailingMoeV3DecodeRouter(configuration)
-        _gateProj.wrappedValue = Linear(
+        _gateProj.wrappedValue = BailingMoeV3DecodeLinear(
             configuration.hiddenSize, configuration.numExperts, bias: false)
         _expertBias.wrappedValue = MLXArray.zeros([configuration.numExperts])
     }
@@ -624,14 +688,15 @@ private class BailingMoeV3KDAAttention: Module, BailingMoeV3Attention {
     init(_ configuration: BailingMoeV3Configuration) {
         self.configuration = configuration
         let projectionSize = configuration.projectionSize
-        _qkvProj.wrappedValue = Linear(
+        _qkvProj.wrappedValue = BailingMoeV3DecodeLinear(
             configuration.hiddenSize, 3 * projectionSize, bias: false)
-        _fbgProj.wrappedValue = Linear(
+        _fbgProj.wrappedValue = BailingMoeV3DecodeLinear(
             configuration.hiddenSize,
             2 * projectionSize + configuration.numAttentionHeads,
             bias: false
         )
-        _oProj.wrappedValue = Linear(projectionSize, configuration.hiddenSize, bias: false)
+        _oProj.wrappedValue = BailingMoeV3DecodeLinear(
+            projectionSize, configuration.hiddenSize, bias: false)
         _qConv.wrappedValue = Conv1d(
             inputChannels: projectionSize, outputChannels: projectionSize,
             kernelSize: configuration.shortConvKernelSize, groups: projectionSize, bias: false)
@@ -804,16 +869,17 @@ private class BailingMoeV3MLAAttention: Module, BailingMoeV3Attention {
 
         if configuration.qLoraRank > 0 {
             _qProj.wrappedValue = nil
-            _qAProj.wrappedValue = Linear(configuration.hiddenSize, configuration.qLoraRank, bias: false)
+            _qAProj.wrappedValue = BailingMoeV3DecodeLinear(
+                configuration.hiddenSize, configuration.qLoraRank, bias: false)
             _qALayerNorm.wrappedValue = RMSNorm(
                 dimensions: configuration.qLoraRank, eps: configuration.rmsNormEps)
-            _qBProj.wrappedValue = Linear(
+            _qBProj.wrappedValue = BailingMoeV3DecodeLinear(
                 configuration.qLoraRank,
                 configuration.numAttentionHeads * configuration.qkHeadDim,
                 bias: false
             )
         } else {
-            _qProj.wrappedValue = Linear(
+            _qProj.wrappedValue = BailingMoeV3DecodeLinear(
                 configuration.hiddenSize,
                 configuration.numAttentionHeads * configuration.qkHeadDim,
                 bias: false
@@ -822,18 +888,18 @@ private class BailingMoeV3MLAAttention: Module, BailingMoeV3Attention {
             _qALayerNorm.wrappedValue = nil
             _qBProj.wrappedValue = nil
         }
-        _kvAProjWithMqa.wrappedValue = Linear(
+        _kvAProjWithMqa.wrappedValue = BailingMoeV3DecodeLinear(
             configuration.hiddenSize, configuration.kvLoraRank + configuration.qkRopeHeadDim,
             bias: false)
         _kvALayerNorm.wrappedValue = RMSNorm(
             dimensions: configuration.kvLoraRank, eps: configuration.rmsNormEps)
-        _kvBProj.wrappedValue = Linear(
+        _kvBProj.wrappedValue = BailingMoeV3DecodeLinear(
             configuration.kvLoraRank,
             configuration.numAttentionHeads * (configuration.qkNopeHeadDim + configuration.vHeadDim),
             bias: false)
-        _gProj.wrappedValue = Linear(
+        _gProj.wrappedValue = BailingMoeV3DecodeLinear(
             configuration.hiddenSize, configuration.numAttentionHeads, bias: false)
-        _dense.wrappedValue = Linear(
+        _dense.wrappedValue = BailingMoeV3DecodeLinear(
             configuration.numAttentionHeads * configuration.vHeadDim, configuration.hiddenSize,
             bias: false)
     }
@@ -960,7 +1026,8 @@ public class BailingMoeV3Model: Module, LLMModel, KVCacheDimensionProvider {
         self.kvHeads = Array(repeating: configuration.numAttentionHeads, count: configuration.numHiddenLayers)
         _model.wrappedValue = BailingMoeV3ModelInner(configuration)
         if !configuration.tieWordEmbeddings {
-            _lmHead.wrappedValue = Linear(configuration.hiddenSize, configuration.vocabularySize, bias: false)
+            _lmHead.wrappedValue = BailingMoeV3DecodeLinear(
+                configuration.hiddenSize, configuration.vocabularySize, bias: false)
         }
     }
 
