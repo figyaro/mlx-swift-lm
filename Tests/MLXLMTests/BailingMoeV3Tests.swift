@@ -169,6 +169,22 @@ struct BailingMoeV3Tests {
         #expect(sanitized["model.layers.3.mlp.gate.weight"] == nil)
         #expect(sanitized["model.layers.3.mlp.gate.gate_proj.weight"] != nil)
 
+        // Pre-quantized MLX checkpoints keep scales/biases beside each packed
+        // projection. Fusing only the packed weights drops that metadata and
+        // leaves the runtime expecting the original dense input width.
+        let quantizedGate = model.sanitize(weights: [
+            "model.layers.0.mlp.gate_proj.weight": MLXArray.zeros([16, 8]),
+            "model.layers.0.mlp.gate_proj.scales": MLXArray.zeros([16, 1]),
+            "model.layers.0.mlp.gate_proj.biases": MLXArray.zeros([16, 1]),
+            "model.layers.0.mlp.up_proj.weight": MLXArray.zeros([16, 8]),
+            "model.layers.0.mlp.up_proj.scales": MLXArray.zeros([16, 1]),
+            "model.layers.0.mlp.up_proj.biases": MLXArray.zeros([16, 1]),
+        ])
+        #expect(quantizedGate["model.layers.0.mlp.gate_up_proj.weight"]?.shape == [32, 8])
+        #expect(quantizedGate["model.layers.0.mlp.gate_up_proj.scales"]?.shape == [32, 1])
+        #expect(quantizedGate["model.layers.0.mlp.gate_up_proj.biases"]?.shape == [32, 1])
+        #expect(quantizedGate["model.layers.0.mlp.gate_proj.scales"] == nil)
+
         let cache = model.newCache(parameters: nil)
         let logits = model(
             MLXArray([1, 2] as [Int32]).reshaped(1, 2), cache: cache)

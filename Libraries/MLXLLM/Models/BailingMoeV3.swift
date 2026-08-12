@@ -247,6 +247,16 @@ private func bailingMoeV3L2Normalize(_ x: MLXArray) -> MLXArray {
     return x * (meanSquares + 1e-6).rsqrt()
 }
 
+private let bailingMoeV3DisableFusedKDA =
+    ProcessInfo.processInfo.environment["DENOJU_LING_DISABLE_FUSED_KDA"] == "1"
+private let bailingMoeV3DisableFusedKDADecode =
+    ProcessInfo.processInfo.environment["DENOJU_LING_DISABLE_FUSED_KDA_DECODE"] == "1"
+// The shared feature-decay SIMD kernel is decode-safe but has a multi-token
+// regression when reused across ChatSessions. Keep the reference prefill path
+// as the default until that kernel receives a dedicated correctness proof.
+private let bailingMoeV3EnableFusedKDAPrefill =
+    ProcessInfo.processInfo.environment["DENOJU_LING_ENABLE_FUSED_KDA_PREFILL"] == "1"
+
 /// Decode-only compression for the wide dense projections around the routed
 /// experts. Ollama's latest Bailing path quantizes float passthrough tensors
 /// on request because lm_head and attention projections otherwise dominate
@@ -753,7 +763,9 @@ private class BailingMoeV3KDAAttention: Module, BailingMoeV3Attention {
             dtype: .float32
         )
         let recurrence: (output: MLXArray, state: MLXArray)
-        if length == 1, configuration.headDim.isMultiple(of: 32) {
+        if length == 1, configuration.headDim.isMultiple(of: 32),
+            !bailingMoeV3DisableFusedKDA,
+            !bailingMoeV3DisableFusedKDADecode {
             let decodeStep = configuration.kdaSafeGate
                 ? bailingMoeV3KDADecodeStepSafe
                 : bailingMoeV3KDADecodeStepSoftplus
@@ -788,7 +800,9 @@ private class BailingMoeV3KDAAttention: Module, BailingMoeV3Attention {
                 logDecay = -(aExp * MLXNN.softplus(decayInput + dt))
             }
             let decay = exp(logDecay)
-            if configuration.headDim.isMultiple(of: 32) {
+            if configuration.headDim.isMultiple(of: 32),
+                !bailingMoeV3DisableFusedKDA,
+                bailingMoeV3EnableFusedKDAPrefill {
                 recurrence = gatedDeltaFeatureDecay(
                     q: normalizedQ,
                     k: normalizedK,
@@ -830,7 +844,9 @@ private class BailingMoeV3KDAAttention: Module, BailingMoeV3Attention {
 
         var output = recurrence.output
         output = oNorm(output)
-        if length == 1, configuration.headDim.isMultiple(of: 32) {
+        if length == 1, configuration.headDim.isMultiple(of: 32),
+            !bailingMoeV3DisableFusedKDA,
+            !bailingMoeV3DisableFusedKDADecode {
             output = bailingMoeV3KDAOutputGate(
                 output,
                 fbgParts[2].reshaped(
@@ -1063,10 +1079,38 @@ public class BailingMoeV3Model: Module, LLMModel, KVCacheDimensionProvider {
             // the normal model conversion path when a quantized variant is made.
             func fuseRows(_ keys: [String], into outputKey: String) {
                 guard keys.allSatisfy({ sanitized[$0] != nil }) else { return }
-                let tensors = keys.compactMap { sanitized[$0] }
-                sanitized[outputKey] = concatenated(tensors, axis: 0)
+                let bases = keys.map { String($0.dropLast(".weight".count)) }
+                let scales = bases.compactMap { sanitized["\($0).scales"] }
+                let quantized = scales.count == bases.count
+                if quantized {
+                    sanitized[outputKey] = concatenated(
+                        keys.compactMap { sanitized[$0] }, axis: 0)
+                    sanitized["\(outputKey.dropLast(".weight".count)).scales"] =
+                        concatenated(scales, axis: 0)
+
+                    let biases = bases.compactMap { sanitized["\($0).biases"] }
+                    if biases.count == bases.count {
+                        sanitized["\(outputKey.dropLast(".weight".count)).biases"] =
+                            concatenated(biases, axis: 0)
+                    } else {
+                        sanitized["\(outputKey.dropLast(".weight".count)).biases"] = nil
+                    }
+                } else {
+                    // A partially quantized fusion is ambiguous. Leave the
+                    // tensors untouched so the loader can report the exact
+                    // incompatible checkpoint instead of silently mixing
+                    // packed and dense metadata.
+                    guard scales.isEmpty else { return }
+                    sanitized[outputKey] = concatenated(
+                        keys.compactMap { sanitized[$0] }, axis: 0)
+                    sanitized["\(outputKey.dropLast(".weight".count)).scales"] = nil
+                    sanitized["\(outputKey.dropLast(".weight".count)).biases"] = nil
+                }
                 for key in keys {
                     sanitized[key] = nil
+                    let base = String(key.dropLast(".weight".count))
+                    sanitized["\(base).scales"] = nil
+                    sanitized["\(base).biases"] = nil
                 }
             }
 
@@ -1094,6 +1138,13 @@ public class BailingMoeV3Model: Module, LLMModel, KVCacheDimensionProvider {
                 )
                 for projection in ["q_conv1d", "k_conv1d", "v_conv1d"] {
                     let key = "\(prefix).attention.\(projection).weight"
+                    let nestedKey = "\(prefix).attention.\(projection).conv.weight"
+                    // Some MLX conversions preserve Conv1d's `conv` child in
+                    // the safetensors path, while the native Ling checkpoint
+                    // uses the flattened projection name.
+                    if sanitized[key] == nil, let nested = sanitized.removeValue(forKey: nestedKey) {
+                        sanitized[key] = nested
+                    }
                     if let weight = sanitized[key], weight.ndim == 3, weight.dim(1) == 1 {
                         sanitized[key] = weight.movedAxis(source: 2, destination: 1)
                     }
@@ -1115,21 +1166,100 @@ public class BailingMoeV3Model: Module, LLMModel, KVCacheDimensionProvider {
             let expertDownKeys = (0 ..< configuration.numExperts).map {
                 "\(prefix).mlp.experts.\($0).down_proj.weight"
             }
+            // MLX-native conversions store expert tensors already stacked as
+            // [experts, rows, packed_columns], rather than one tensor per
+            // expert as in the original Transformers checkpoint.
+            let stackedExpertGate = "\(prefix).mlp.experts.gate_proj"
+            let stackedExpertUp = "\(prefix).mlp.experts.up_proj"
+            let stackedExpertDown = "\(prefix).mlp.experts.down_proj"
+            let switchGateUp = "\(prefix).mlp.switch_mlp.gate_up_proj"
+            let switchDown = "\(prefix).mlp.switch_mlp.down_proj"
+            if sanitized["\(stackedExpertGate).weight"] != nil,
+                sanitized["\(stackedExpertUp).weight"] != nil {
+                sanitized["\(switchGateUp).weight"] = concatenated([
+                    sanitized["\(stackedExpertGate).weight"]!,
+                    sanitized["\(stackedExpertUp).weight"]!,
+                ], axis: 1)
+                if let gateScales = sanitized["\(stackedExpertGate).scales"],
+                    let upScales = sanitized["\(stackedExpertUp).scales"] {
+                    sanitized["\(switchGateUp).scales"] = concatenated(
+                        [gateScales, upScales], axis: 1)
+                }
+                if let gateBiases = sanitized["\(stackedExpertGate).biases"],
+                    let upBiases = sanitized["\(stackedExpertUp).biases"] {
+                    sanitized["\(switchGateUp).biases"] = concatenated(
+                        [gateBiases, upBiases], axis: 1)
+                }
+                for base in [stackedExpertGate, stackedExpertUp] {
+                    sanitized["\(base).weight"] = nil
+                    sanitized["\(base).scales"] = nil
+                    sanitized["\(base).biases"] = nil
+                }
+            }
+            if sanitized["\(stackedExpertDown).weight"] != nil {
+                for suffix in ["weight", "scales", "biases"] {
+                    if let value = sanitized["\(stackedExpertDown).\(suffix)"] {
+                        sanitized["\(switchDown).\(suffix)"] = value
+                    }
+                    sanitized["\(stackedExpertDown).\(suffix)"] = nil
+                }
+            }
             if expertGateKeys.allSatisfy({ sanitized[$0] != nil })
                 && expertUpKeys.allSatisfy({ sanitized[$0] != nil }) {
+                let gateBases = expertGateKeys.map { String($0.dropLast(".weight".count)) }
+                let upBases = expertUpKeys.map { String($0.dropLast(".weight".count)) }
+                let gateScales = gateBases.compactMap { sanitized["\($0).scales"] }
+                let upScales = upBases.compactMap { sanitized["\($0).scales"] }
+                let quantized = gateScales.count == gateBases.count
+                    && upScales.count == upBases.count
                 let fusedExperts = zip(expertGateKeys, expertUpKeys).map { gateKey, upKey in
                     concatenated([sanitized[gateKey]!, sanitized[upKey]!], axis: 0)
                 }
-                sanitized["\(prefix).mlp.switch_mlp.gate_up_proj.weight"] = stacked(fusedExperts)
+                let outputBase = "\(prefix).mlp.switch_mlp.gate_up_proj"
+                sanitized["\(outputBase).weight"] = stacked(fusedExperts)
+                if quantized {
+                    let fusedScales = zip(gateScales, upScales).map {
+                        concatenated([$0, $1], axis: 0)
+                    }
+                    sanitized["\(outputBase).scales"] = stacked(fusedScales)
+                    let gateBiases = gateBases.compactMap { sanitized["\($0).biases"] }
+                    let upBiases = upBases.compactMap { sanitized["\($0).biases"] }
+                    if gateBiases.count == gateBases.count && upBiases.count == upBases.count {
+                        let fusedBiases = zip(gateBiases, upBiases).map {
+                            concatenated([$0, $1], axis: 0)
+                        }
+                        sanitized["\(outputBase).biases"] = stacked(fusedBiases)
+                    } else {
+                        sanitized["\(outputBase).biases"] = nil
+                    }
+                }
                 for key in expertGateKeys + expertUpKeys {
                     sanitized[key] = nil
+                    let base = String(key.dropLast(".weight".count))
+                    sanitized["\(base).scales"] = nil
+                    sanitized["\(base).biases"] = nil
                 }
             }
             if expertDownKeys.allSatisfy({ sanitized[$0] != nil }) {
-                sanitized["\(prefix).mlp.switch_mlp.down_proj.weight"] = stacked(
+                let downBases = expertDownKeys.map { String($0.dropLast(".weight".count)) }
+                let downScales = downBases.compactMap { sanitized["\($0).scales"] }
+                let outputBase = "\(prefix).mlp.switch_mlp.down_proj"
+                sanitized["\(outputBase).weight"] = stacked(
                     expertDownKeys.compactMap { sanitized[$0] })
+                if downScales.count == downBases.count {
+                    sanitized["\(outputBase).scales"] = stacked(downScales)
+                    let downBiases = downBases.compactMap { sanitized["\($0).biases"] }
+                    if downBiases.count == downBases.count {
+                        sanitized["\(outputBase).biases"] = stacked(downBiases)
+                    } else {
+                        sanitized["\(outputBase).biases"] = nil
+                    }
+                }
                 for key in expertDownKeys {
                     sanitized[key] = nil
+                    let base = String(key.dropLast(".weight".count))
+                    sanitized["\(base).scales"] = nil
+                    sanitized["\(base).biases"] = nil
                 }
             }
 
