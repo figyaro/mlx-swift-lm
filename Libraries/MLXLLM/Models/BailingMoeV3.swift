@@ -270,7 +270,9 @@ private enum BailingMoeV3DecodeQuantization {
 }
 
 private final class BailingMoeV3DecodeLinear: Linear {
-    private var decodeQuantizedWeight:
+    // The leading underscore keeps this runtime cache out of MLX Module
+    // parameter reflection and weight serialization.
+    private var _decodeQuantizedWeight:
         (weight: MLXArray, scales: MLXArray, biases: MLXArray?)?
     private let decodeQuantizedWeightLock = NSLock()
 
@@ -282,7 +284,7 @@ private final class BailingMoeV3DecodeLinear: Linear {
         }
 
         decodeQuantizedWeightLock.lock()
-        if decodeQuantizedWeight == nil {
+        if _decodeQuantizedWeight == nil {
             let quantized = MLX.quantized(
                 weight,
                 groupSize: BailingMoeV3DecodeQuantization.groupSize,
@@ -295,10 +297,10 @@ private final class BailingMoeV3DecodeLinear: Linear {
             // Publish only evaluated immutable tensors. MLXArray lazy graphs
             // must not be initialized concurrently by separate chat sessions.
             eval(arrays)
-            decodeQuantizedWeight = (
+            _decodeQuantizedWeight = (
                 weight: quantized.0, scales: quantized.1, biases: quantized.2)
         }
-        let quantized = decodeQuantizedWeight!
+        let quantized = _decodeQuantizedWeight!
         decodeQuantizedWeightLock.unlock()
 
         return MLX.quantizedMM(
